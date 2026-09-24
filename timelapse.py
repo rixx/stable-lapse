@@ -258,6 +258,7 @@ def watch(
     min_interval: float,
     max_interval: float,
     fps: int,
+    max_duration: int,
     keep_frames: bool,
 ) -> None:
     log("watching for jobs")
@@ -268,7 +269,7 @@ def watch(
         if snap:
             if snap.active and (sess is None or job_id != snap.job_id):
                 if sess:
-                    finish(sess, fps, keep_frames)
+                    finish(sess, fps, max_duration, keep_frames)
                 name = slug(job_name(printer))
                 out = Path(outdir) / f"{dt.datetime.now():%Y%m%d-%H%M}-{name}"
                 log(f"job {snap.job_id} {name!r} started")
@@ -277,19 +278,19 @@ def watch(
             elif sess and not snap.active:
                 sess.grab("end")
                 log(f"job {job_id} ended ({snap.state})")
-                finish(sess, fps, keep_frames)
+                finish(sess, fps, max_duration, keep_frames)
                 sess = None
             elif sess:
                 sess.maybe_layer(snap.z, min_interval, max_interval)
         time.sleep(poll)
 
 
-def finish(sess: Session, fps: int, keep_frames: bool) -> None:
+def finish(sess: Session, fps: int, max_duration: int, keep_frames: bool) -> None:
     if sess.n < 2:
         log(f"{sess.out}: only {sess.n} frames, not rendering")
         return
     try:
-        render(sess.out, sess.out.with_suffix(".mp4"), fps)
+        render(sess.out, sess.out.with_suffix(".mp4"), fps, max_duration=max_duration)
     except subprocess.CalledProcessError as e:
         log(f"render failed: {e.stderr.decode(errors='replace')[-500:]}")
         return
@@ -297,8 +298,21 @@ def finish(sess: Session, fps: int, keep_frames: bool) -> None:
         shutil.rmtree(sess.out)
 
 
+def thin(files: list[Path], limit: int) -> list[Path]:
+    # Evenly spaced subset of at most limit frames, first and last kept
+    if not limit or len(files) <= limit:
+        return files
+    step = (len(files) - 1) / (limit - 1)
+    return [files[round(i * step)] for i in range(limit)]
+
+
 def render(
-    frames: Path | str, out: Path | str, fps: int = 30, hold: float = 2.0, crf: int = 20
+    frames: Path | str,
+    out: Path | str,
+    fps: int = 30,
+    hold: float = 2.0,
+    crf: int = 20,
+    max_duration: int = 20,
 ) -> Path:
     frames, out = Path(frames), Path(out)
     if not frames.is_dir():
@@ -306,6 +320,7 @@ def render(
     files = sorted(frames.glob("*.jpg"))
     if len(files) < 2:
         raise SystemExit(f"{frames}: {len(files)} frames, nothing to render")
+    files = thin(files, fps * max_duration if max_duration else 0)
     concat = frames / "frames.txt"
     concat.write_text("".join(f"file '{f.name}'\n" for f in files))
     vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
@@ -385,6 +400,12 @@ def main() -> None:
     )
     w.add_argument("--outdir", default=cfg["output"]["dir"])
     w.add_argument("--fps", type=int, default=30)
+    w.add_argument(
+        "--max-duration",
+        type=int,
+        default=20,
+        help="seconds; drops frames evenly to fit, 0 = keep all",
+    )
     w.add_argument("--max-interval", type=float, default=0)
     w.add_argument("--min-interval", type=float, default=3)
     w.add_argument("--poll", type=float, default=2)
@@ -401,6 +422,12 @@ def main() -> None:
         help="seconds to freeze the last frame for a less abrupt ending",
     )
     r.add_argument("--crf", type=int, default=20)
+    r.add_argument(
+        "--max-duration",
+        type=int,
+        default=20,
+        help="seconds; drops frames evenly to fit, 0 = keep all",
+    )
 
     sub.add_parser("status", help="Print PrusaLink status")
 
@@ -421,7 +448,12 @@ def main() -> None:
         )
     elif a.cmd == "render":
         render(
-            a.frames, a.out or Path(a.frames).with_suffix(".mp4"), a.fps, a.hold, a.crf
+            a.frames,
+            a.out or Path(a.frames).with_suffix(".mp4"),
+            a.fps,
+            a.hold,
+            a.crf,
+            a.max_duration,
         )
     elif a.cmd == "capture":
         out = a.out or Path(cfg["output"]["dir"]) / f"{dt.datetime.now():%Y%m%d-%H%M}"
@@ -450,6 +482,7 @@ def main() -> None:
             a.min_interval,
             a.max_interval,
             a.fps,
+            a.max_duration,
             a.keep_frames,
         )
 
