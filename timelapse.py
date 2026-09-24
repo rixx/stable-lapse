@@ -12,7 +12,7 @@ Usage: timelapse.py [command]
     status   one PrusaLink status line
 
 --experimental (capture, watch): reads the camera stream and for each layer keeps
-the frame with the printer head (overwrite head.png if yours differs; matches on
+the frame with the printer head (overwrite .head.png if yours differs; matches on
 the fan) closest to --target so the timelapse looks cleaner.
 
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
@@ -54,13 +54,17 @@ DEFAULTS = {
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
 GIF_WIDTH = 640
-TEMPLATE = Path(__file__).resolve().parent / "head.png"
+TEMPLATE = Path(__file__).resolve().parent / ".head.png"
 STREAM_FPS = 6
 HEAD_SCORE = 0.62  # template match score needed to trust a head position
 
 
 def log(msg: str) -> None:
-    print(f"{dt.datetime.now():%H:%M:%S} {msg}", file=sys.stderr, flush=True)
+    line = f"{dt.datetime.now():%H:%M:%S} {msg}"
+    print(line, file=sys.stderr, flush=True)
+    if LOGFILE:
+        with LOGFILE.open("a") as f:
+            f.write(line + "\n")
 
 
 def load_config() -> dict[str, dict[str, Any]]:
@@ -69,6 +73,11 @@ def load_config() -> dict[str, dict[str, Any]]:
         for section, values in tomllib.loads(CONFIG.read_text()).items():
             cfg.setdefault(section, {}).update(values)
     return cfg
+
+
+CFG = load_config()
+BASE = Path(CFG["output"]["dir"])
+FRAMES, LOGS, RENDER = BASE / "frames", BASE / "logs", BASE / "render"
 
 
 def grab(url: str, dest: Path, timeout: float = 20) -> bool:
@@ -200,26 +209,38 @@ class LayerTracker:
         self.layer: float | None = None
         self.prev: float | None = None
 
-    def update(self, z: float | None) -> bool:
+    def update(self, z: float | None) -> str | None:
+        # "layer" on a new layer, "end" on the end gcode lift, else None
         stable = z is not None and z == self.prev
         self.prev = z
-        if stable and z is not None and (self.layer is None or z > self.layer + Z_STEP):
-            self.layer = z
-            return True
-        return False
+        if (
+            not stable
+            or z is None
+            or (self.layer is not None and z <= self.layer + Z_STEP)
+        ):
+            return None
+        event = (
+            "end" if self.layer is not None and z > self.layer + END_LIFT else "layer"
+        )
+        self.layer = z
+        return event
 
 
 class Session:
     def __init__(self, camera: str, out: Path | str):
+        global LOGFILE
         self.camera = camera
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.n = len(list(self.out.glob("[0-9]*.jpg")))
         self.layers = LayerTracker()
         self.last_t = 0.0
+        LOGS.mkdir(parents=True, exist_ok=True)
+        LOGFILE = LOGS / f"{self.out.name}.log"
 
     def close(self) -> None:
-        pass
+        global LOGFILE
+        LOGFILE = None
 
     def grab(self, why: str = "") -> bool:
         dest = self.out / f"{self.n:05d}.jpg"
@@ -460,7 +481,9 @@ def finish(sess: Session, fps: int, max_duration: int, keep_frames: bool) -> Non
         log(f"{sess.out}: only {sess.n} frames, not rendering")
         return
     try:
-        render(sess.out, sess.out.with_suffix(".mp4"), fps, max_duration=max_duration)
+        render(
+            sess.out, RENDER / f"{sess.out.name}.mp4", fps, max_duration=max_duration
+        )
     except subprocess.CalledProcessError as e:
         log(f"render failed: {e.stderr.decode(errors='replace')[-500:]}")
         return
@@ -486,6 +509,7 @@ def render(
     gif: bool = False,
 ) -> Path:
     frames, out = Path(frames), Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     if not frames.is_dir():
         raise SystemExit(f"{frames}: no such directory")
     files = sorted(frames.glob("*.jpg"))
@@ -530,7 +554,7 @@ def render(
 
 
 def main() -> None:
-    cfg = load_config()
+    cfg = CFG
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -549,14 +573,14 @@ def main() -> None:
     )
     exp.add_argument(
         "--target",
-        help="pixel x,y of the head template centre; default: first detection",
+        help="pixel x,y to park the head at; default: least of the print covered",
     )
     exp.add_argument(
         "--template", default=str(TEMPLATE), help="grayscale crop of the print head"
     )
 
     c = sub.add_parser("capture", help="Grab frames now", parents=[exp])
-    c.add_argument("--out", help="frames directory (default: <output dir>/<timestamp>)")
+    c.add_argument("--out", help="frames directory (default: frames/<timestamp>)")
     c.add_argument(
         "--interval",
         type=float,
@@ -582,7 +606,7 @@ def main() -> None:
     w = sub.add_parser(
         "watch", help="Run as daemon, create one timelapse per print job", parents=[exp]
     )
-    w.add_argument("--outdir", default=cfg["output"]["dir"])
+    w.add_argument("--outdir", default=str(FRAMES))
     w.add_argument("--fps", type=int, default=30)
     w.add_argument(
         "--max-duration",
@@ -597,7 +621,7 @@ def main() -> None:
 
     r = sub.add_parser("render", help="Render an mp4")
     r.add_argument("frames")
-    r.add_argument("--out", help="default: <frames dir>.mp4 or .gif")
+    r.add_argument("--out", help="default: render/<frames dir name>.mp4 or .gif")
     r.add_argument(
         "--gif",
         action="store_true",
@@ -634,9 +658,12 @@ def main() -> None:
             f"left={j.get('time_remaining')}s nozzle={p.get('temp_nozzle')} bed={p.get('temp_bed')}"
         )
     elif a.cmd == "render":
+        frames = Path(a.frames)
+        if not frames.is_dir() and (FRAMES / a.frames).is_dir():
+            frames = FRAMES / a.frames
         render(
-            a.frames,
-            a.out or Path(a.frames).with_suffix(".gif" if a.gif else ".mp4"),
+            frames,
+            a.out or RENDER / f"{frames.name}.{'gif' if a.gif else 'mp4'}",
             a.fps or (10 if a.gif else 30),
             a.hold if a.hold is not None else (1 if a.gif else 2),
             a.crf,
@@ -644,7 +671,7 @@ def main() -> None:
             a.gif,
         )
     elif a.cmd == "capture":
-        out = a.out or Path(cfg["output"]["dir"]) / f"{dt.datetime.now():%Y%m%d-%H%M}"
+        out = Path(a.out) if a.out else FRAMES / f"{dt.datetime.now():%Y%m%d-%H%M}"
         if a.interval:
             capture_interval(a.camera, out, a.interval, a.duration)
         else:
