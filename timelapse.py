@@ -178,7 +178,9 @@ def job_name(printer: Printer) -> str:
 
 
 def slug(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).stem).strip("_")[:60] or "print"
+    # Drop technical part (nozzle, etc)
+    name = re.split(r"_\d\.\dn_", Path(name).stem, maxsplit=1)[0]
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")[:60] or "print"
 
 
 class Session:
