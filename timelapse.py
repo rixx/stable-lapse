@@ -301,6 +301,8 @@ def render(
     frames: Path | str, out: Path | str, fps: int = 30, hold: float = 2.0, crf: int = 20
 ) -> Path:
     frames, out = Path(frames), Path(out)
+    if not frames.is_dir():
+        raise SystemExit(f"{frames}: no such directory")
     files = sorted(frames.glob("*.jpg"))
     if len(files) < 2:
         raise SystemExit(f"{frames}: {len(files)} frames, nothing to render")
