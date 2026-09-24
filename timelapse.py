@@ -53,6 +53,7 @@ DEFAULTS = {
 }
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
+GIF_WIDTH = 640
 TEMPLATE = Path(__file__).resolve().parent / "head.png"
 STREAM_FPS = 6
 HEAD_SCORE = 0.62  # template match score needed to trust a head position
@@ -482,6 +483,7 @@ def render(
     hold: float = 2.0,
     crf: int = 20,
     max_duration: int = 20,
+    gif: bool = False,
 ) -> Path:
     frames, out = Path(frames), Path(out)
     if not frames.is_dir():
@@ -495,6 +497,13 @@ def render(
     vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
     if hold:
         vf += f",tpad=stop_mode=clone:stop_duration={hold}"
+    codec = ["-c:v", "libx264", "-preset", "slow", "-crf", str(crf), "-movflags", "+faststart"]  # fmt: skip
+    if gif:
+        vf += (
+            f",scale={GIF_WIDTH}:-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];"
+            "[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+        )
+        codec = ["-loop", "0"]
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -509,16 +518,9 @@ def render(
         "0",
         "-i",
         str(concat),
-        "-vf",
+        "-filter_complex",
         vf,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        str(crf),
-        "-movflags",
-        "+faststart",
+        *codec,
         str(out),
     ]
     subprocess.run(cmd, check=True, capture_output=True)
@@ -595,20 +597,23 @@ def main() -> None:
 
     r = sub.add_parser("render", help="Render an mp4")
     r.add_argument("frames")
-    r.add_argument("--out", help="default: <frames dir>.mp4")
-    r.add_argument("--fps", type=int, default=30)
+    r.add_argument("--out", help="default: <frames dir>.mp4 or .gif")
+    r.add_argument(
+        "--gif",
+        action="store_true",
+        help=f"{GIF_WIDTH}px wide looping gif instead of mp4",
+    )
+    r.add_argument("--fps", type=int, help="default 30, gif 10")
     r.add_argument(
         "--hold",
         type=float,
-        default=2,
-        help="seconds to freeze the last frame for a less abrupt ending",
+        help="seconds to freeze the last frame for a less abrupt ending; default 2, gif 1",
     )
     r.add_argument("--crf", type=int, default=20)
     r.add_argument(
         "--max-duration",
         type=int,
-        default=20,
-        help="seconds; drops frames evenly to fit, 0 = keep all",
+        help="seconds; drops frames evenly to fit, 0 = keep all; default 20, gif 3",
     )
 
     sub.add_parser("status", help="Print PrusaLink status")
@@ -631,11 +636,12 @@ def main() -> None:
     elif a.cmd == "render":
         render(
             a.frames,
-            a.out or Path(a.frames).with_suffix(".mp4"),
-            a.fps,
-            a.hold,
+            a.out or Path(a.frames).with_suffix(".gif" if a.gif else ".mp4"),
+            a.fps or (10 if a.gif else 30),
+            a.hold if a.hold is not None else (1 if a.gif else 2),
             a.crf,
-            a.max_duration,
+            a.max_duration if a.max_duration is not None else (3 if a.gif else 20),
+            a.gif,
         )
     elif a.cmd == "capture":
         out = a.out or Path(cfg["output"]["dir"]) / f"{dt.datetime.now():%Y%m%d-%H%M}"
