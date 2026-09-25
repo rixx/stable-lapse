@@ -4,16 +4,15 @@
 # dependencies = ["opencv-python-headless", "numpy"]
 # ///
 """Render cool 3d print timelapses from an RTSP camera and PrusaLink.
+Uses OpenCV to pick the frame that shows the largest part of the print (with the print head
+and the gantry as much out of the way as possible). Overwrite .head.png with a similar png
+of your own print head fan if you don't have a Core One.
 
 Usage: timelapse.py [command]
     capture  grab frames right now (per layer if PrusaLink is configured, otherwise just per interval)
     watch    wait for print jobs, capture each one per layer, render on finish
     render   build an mp4 for the given directory or for all
     status   one PrusaLink status line
-
---experimental (capture, watch): reads the camera stream and for each layer keeps
-the frame with the printer head (overwrite .head.png if yours differs; matches on
-the fan) closest to --target so the timelapse looks cleaner.
 
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
     [printer]
@@ -28,6 +27,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -53,10 +53,22 @@ DEFAULTS = {
 }
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
+END_LIFT = 5
+FIRST_LAYER_MAX = 1.0
+STABLE_POLLS = 3
+MIN_LAYERS = 3
+JOIN_GRACE = 600  # seconds into a job after which no start-up gate applies
 GIF_WIDTH = 640
 TEMPLATE = Path(__file__).resolve().parent / ".head.png"
 STREAM_FPS = 6
-HEAD_SCORE = 0.62  # template match score needed to trust a head position
+REPLAY_FPS = 2
+HEAD_SCORE = 0.66  # template match score needed to trust a head position
+HEAD_SCALES = (1.0, 0.85, 0.7, 0.6)  # the head shrinks towards the back of the bed
+BG_SAMPLES = 40  # frames per layer
+BG_DIFF = 0.8  # normalised grey difference that counts as covered
+
+
+LOGFILE: Path | None = None
 
 
 def log(msg: str) -> None:
@@ -174,6 +186,7 @@ class Snap(NamedTuple):
     job_id: int | None
     z: float | None
     progress: float | None
+    time_printing: float | None
 
     @property
     def active(self) -> bool:
@@ -187,7 +200,13 @@ def snapshot(printer: Printer) -> Snap | None:
         log(f"printer unreachable: {e}")
         return None
     p, j = s.get("printer", {}), s.get("job") or {}
-    return Snap(p.get("state", "?"), j.get("id"), p.get("axis_z"), j.get("progress"))
+    return Snap(
+        p.get("state", "?"),
+        j.get("id"),
+        p.get("axis_z"),
+        j.get("progress"),
+        j.get("time_printing"),
+    )
 
 
 def job_name(printer: Printer) -> str:
@@ -204,36 +223,51 @@ def slug(name: str) -> str:
 
 
 class LayerTracker:
-    # z must hold for two polls: ramping lift moves z during travels
-    def __init__(self) -> None:
+    def __init__(self, gate: bool = True) -> None:
+        # The print is about to start, so ignore z until it settles
+        self.gate = gate
         self.layer: float | None = None
         self.prev: float | None = None
+        self.held = 0
+        self.count = 0
 
     def update(self, z: float | None) -> str | None:
         # "layer" on a new layer, "end" on the end gcode lift, else None
-        stable = z is not None and z == self.prev
+        self.held = self.held + 1 if z == self.prev else 1
         self.prev = z
-        if (
-            not stable
-            or z is None
-            or (self.layer is not None and z <= self.layer + Z_STEP)
-        ):
+        if z is None or self.held < STABLE_POLLS:
             return None
-        event = (
-            "end" if self.layer is not None and z > self.layer + END_LIFT else "layer"
-        )
-        self.layer = z
-        return event
+        if self.layer is not None and z < self.layer - END_LIFT:
+            # New print is about to start
+            self.layer, self.gate = None, True
+        if self.layer is None:
+            # Homing, levelling, purging, blah
+            if self.gate and not 0 < z < FIRST_LAYER_MAX:
+                return None
+            self.gate = True
+            self.layer = z
+            self.count = 1
+            return "layer"
+        if z > self.layer + END_LIFT:
+            # Lift for last purge
+            ended = self.count >= MIN_LAYERS
+            self.layer, self.count = None, 0
+            return "end" if ended else None
+        if z > self.layer + Z_STEP:
+            self.layer = z
+            self.count += 1
+            return "layer"
+        return None
 
 
 class Session:
-    def __init__(self, camera: str, out: Path | str):
+    def __init__(self, camera: str, out: Path | str, gate: bool = True):
         global LOGFILE
         self.camera = camera
         self.out = Path(out)
         self.out.mkdir(parents=True, exist_ok=True)
         self.n = len(list(self.out.glob("[0-9]*.jpg")))
-        self.layers = LayerTracker()
+        self.layers = LayerTracker(gate)
         self.last_t = 0.0
         LOGS.mkdir(parents=True, exist_ok=True)
         LOGFILE = LOGS / f"{self.out.name}.log"
@@ -257,12 +291,34 @@ class Session:
     ) -> None:
         # Grab a new image if z has changed enough or max_interval has passed
         since = time.monotonic() - self.last_t
-        if self.layers.update(z):
-            if since >= min_interval:
-                self.grab(f"z={z:.2f}")
+        event = self.layers.update(z)
+        if event == "layer" and since >= min_interval:
+            self.grab(f"z={z:.2f}")
+        if event or self.layers.layer is None:
             return
         if max_interval and since >= max_interval:
             self.grab("interval")
+
+
+def split_jpegs(buf: bytes) -> tuple[list[bytes], bytes]:
+    jpgs = []
+    while (end := buf.find(b"\xff\xd9")) >= 0:
+        start = buf.find(b"\xff\xd8")
+        if 0 <= start < end:
+            jpgs.append(buf[start : end + 2])
+        buf = buf[end + 2 :]
+    return jpgs, buf
+
+
+def file_frames(video: Path, fps: float) -> Iterator[bytes]:
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(video), "-vf", f"fps={fps}", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "2", "-"]  # fmt: skip
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert proc.stdout is not None
+    buf = b""
+    while chunk := proc.stdout.read(65536):
+        buf += chunk
+        jpgs, buf = split_jpegs(buf)
+        yield from jpgs
 
 
 class Stream:
@@ -271,6 +327,7 @@ class Stream:
         self.fps = fps
         self.proc: subprocess.Popen[bytes] | None = None
         self.stopped = False
+        self.failures = 0
 
     def start(self) -> None:
         cmd = [
@@ -287,8 +344,10 @@ class Stream:
         while not self.stopped:
             if self.proc is None or self.proc.poll() is not None:
                 if self.proc is not None:
-                    log("stream ended, restarting")
-                    time.sleep(2)
+                    if self.failures % 30 == 0:
+                        log(f"stream ended, restarting ({self.failures} failures)")
+                    self.failures += 1
+                    time.sleep(min(2 * self.failures, 60))
                 self.start()
                 buf = b""
             assert self.proc is not None and self.proc.stdout is not None
@@ -296,11 +355,10 @@ class Stream:
             if not chunk:
                 continue
             buf += chunk
-            while (end := buf.find(b"\xff\xd9")) >= 0:
-                start = buf.find(b"\xff\xd8")
-                if 0 <= start < end:
-                    yield buf[start : end + 2]
-                buf = buf[end + 2 :]
+            jpgs, buf = split_jpegs(buf)
+            if jpgs:
+                self.failures = 0
+            yield from jpgs
 
     def stop(self) -> None:
         self.stopped = True
@@ -309,15 +367,16 @@ class Stream:
 
 
 class TrackedSession(Session):
-    # Experimental: per layer, keep the frame with the print head closest to a target pixel
     def __init__(
         self,
         camera: str,
         out: Path | str,
         template: Path = TEMPLATE,
         target: tuple[int, int] | None = None,
+        live: bool = True,
+        gate: bool = True,
     ):
-        super().__init__(camera, out)
+        super().__init__(camera, out, gate)
         import cv2
         import numpy as np
 
@@ -325,37 +384,65 @@ class TrackedSession(Session):
         tpl = cv2.imread(str(template), cv2.IMREAD_GRAYSCALE)
         if tpl is None:
             raise SystemExit(f"cannot read template at {template}")
-        self.tpl = cv2.resize(tpl, None, fx=0.5, fy=0.5)
+        self.tpls = [cv2.resize(tpl, None, fx=0.5 * f, fy=0.5 * f) for f in HEAD_SCALES]
         self.target = target
         self.lock = threading.Lock()
         self.latest: bytes | None = None
-        self.best: tuple[float, bytes, tuple[int, int], float] | None = None
-        self.stream = Stream(camera, STREAM_FPS)
-        threading.Thread(target=self._reader, daemon=True).start()
+        self.best: tuple[float, bytes, str] | None = None
+        self.bg: Any = None
+        self.clock = ""  # replay: recording time, logged with each frame
+        self.samples: list[Any] = []
+        self.seen = 0
+        self.stream = Stream(camera, STREAM_FPS) if live else None
+        if self.stream:
+            threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self) -> None:
+        assert self.stream is not None
         for jpg in self.stream.frames():
-            pos, score = self._locate(jpg)
-            with self.lock:
-                self.latest = jpg
-                if score < HEAD_SCORE:
-                    continue
-                if self.target is None:
-                    self.target = pos
-                    log(f"target {pos} (score {score:.2f})")
-                d = math.dist(pos, self.target)
-                if self.best is None or d < self.best[0]:
-                    self.best = (d, jpg, pos, score)
+            self.feed(jpg)
 
-    def _locate(self, jpg: bytes) -> tuple[tuple[int, int], float]:
-        cv2 = self.cv2
-        img = cv2.imdecode(self.np.frombuffer(jpg, self.np.uint8), cv2.IMREAD_GRAYSCALE)
-        img = cv2.resize(img, None, fx=0.5, fy=0.5)
-        _, score, _, (x, y) = cv2.minMaxLoc(
-            cv2.matchTemplate(img, self.tpl, cv2.TM_CCOEFF_NORMED)
+    def feed(self, jpg: bytes) -> None:
+        cost, info = self._cost(jpg)
+        with self.lock:
+            self.latest = jpg
+            if cost is not None and (self.best is None or cost < self.best[0]):
+                self.best = (cost, jpg, info)
+
+    def _cost(self, jpg: bytes) -> tuple[float | None, str]:
+        cv2, np = self.cv2, self.np
+        gray = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if self.target:
+            pos, score = self._locate(gray)
+            if score < HEAD_SCORE:
+                return None, ""
+            return math.dist(pos, self.target), f"head={pos} score={score:.2f}"
+        small = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA).astype(
+            np.float32
         )
-        h, w = self.tpl.shape
-        return ((x + w // 2) * 2, (y + h // 2) * 2), float(score)
+        small = (small - small.mean()) / (small.std() + 1e-6)
+        self.seen += 1
+        if len(self.samples) < BG_SAMPLES:
+            self.samples.append(small)
+        elif random.random() < BG_SAMPLES / self.seen:
+            self.samples[random.randrange(BG_SAMPLES)] = small
+        if self.bg is None:
+            self.bg = small
+        covered = float((np.abs(small - self.bg) > BG_DIFF).mean())
+        return covered, f"covered={covered:.2f}"
+
+    def _locate(self, gray: Any) -> tuple[tuple[int, int], float]:
+        cv2 = self.cv2
+        img = cv2.resize(gray, None, fx=0.5, fy=0.5)
+        best, pos = 0.0, (0, 0)
+        for tpl in self.tpls:
+            _, score, _, (x, y) = cv2.minMaxLoc(
+                cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED)
+            )
+            if score > best:
+                h, w = tpl.shape
+                best, pos = float(score), ((x + w // 2) * 2, (y + h // 2) * 2)
+        return pos, best
 
     def _write(self, jpg: bytes, why: str) -> bool:
         dest = self.out / f"{self.n:05d}.jpg"
@@ -378,27 +465,73 @@ class TrackedSession(Session):
     def maybe_layer(
         self, z: float | None, min_interval: float, max_interval: float
     ) -> None:
-        if not self.layers.update(z):
+        event = self.layers.update(z)
+        if not event:
             return
         with self.lock:
             best, self.best = self.best, None
             latest = self.latest
+            if self.samples:
+                self.bg = self.np.median(self.np.stack(self.samples), axis=0)
+                self.samples, self.seen = [], 0
         if best:
-            d, jpg, pos, score = best
-            self._write(jpg, f"z={z:.2f} head={pos} d={d:.0f} score={score:.2f}")
-        elif latest:
-            self._write(latest, f"z={z:.2f} no head found")
+            _, jpg, info = best
+            self._write(jpg, f"{self.clock} {event} z={z:.2f} {info}".strip())
+        elif latest and event == "layer":
+            self._write(latest, f"z={z:.2f} no candidate")
 
     def close(self) -> None:
-        self.stream.stop()
+        if self.stream:
+            self.stream.stop()
+        super().close()
 
 
-def make_session(camera: str, out: Path | str, a: argparse.Namespace) -> Session:
-    if not a.experimental:
-        return Session(camera, out)
-    target = tuple(int(v) for v in a.target.split(",")) if a.target else None
-    assert target is None or len(target) == 2
-    return TrackedSession(camera, out, Path(a.template), target)
+def parse_target(a: argparse.Namespace) -> tuple[int, int] | None:
+    if not a.target:
+        return None
+    x, y = (int(v) for v in a.target.split(","))
+    return x, y
+
+
+def make_session(
+    camera: str, out: Path | str, a: argparse.Namespace, snap: Snap | None
+) -> Session:
+    gate = not (snap and snap.time_printing and snap.time_printing > JOIN_GRACE)
+    return TrackedSession(camera, out, Path(a.template), parse_target(a), gate=gate)
+
+
+def replay(video: Path, out: Path, a: argparse.Namespace) -> None:
+    zlog = video.with_suffix(".z.log")
+    entries: list[tuple[dt.datetime, str, float | None]] = []
+    for line in zlog.read_text().splitlines():
+        ts, state, zs = line.split()[:3]
+        if state != "ERR":
+            z = None if zs == "None" else float(zs)
+            entries.append((dt.datetime.fromisoformat(ts), state, z))
+    if not entries:
+        raise SystemExit(f"{zlog}: empty")
+    start = entries[0][0]
+    sess = TrackedSession(
+        str(video),
+        out,
+        Path(a.template),
+        parse_target(a),
+        live=False,
+        gate=entries[0][1] not in ACTIVE,
+    )
+    log(f"replaying {video} from {start:%H:%M:%S} into {out}")
+    k = 0
+    for i, jpg in enumerate(file_frames(video, REPLAY_FPS)):
+        t = start + dt.timedelta(seconds=i / REPLAY_FPS)
+        sess.feed(jpg)
+        while k < len(entries) and entries[k][0] <= t:
+            _, state, z = entries[k]
+            k += 1
+            if state in ACTIVE:
+                sess.clock = f"{t:%H:%M:%S}"
+                sess.maybe_layer(z, 0, 0)
+    sess.close()
+    log(f"done: {sess.n} frames")
 
 
 def capture_interval(
@@ -422,14 +555,13 @@ def capture_layers(
     until_done: bool,
     a: argparse.Namespace,
 ) -> None:
-    sess = make_session(camera, out, a)
+    sess = make_session(camera, out, a, snapshot(printer))
     log(f"layer capture into {out}")
     sess.grab("start")
     while True:
         snap = snapshot(printer)
         if snap:
             if until_done and snap.state not in ACTIVE:
-                sess.grab("end")
                 log(f"printer {snap.state}, done: {sess.n} frames")
                 sess.close()
                 return
@@ -459,14 +591,14 @@ def watch(
                 if sess:
                     finish(sess, fps, max_duration, keep_frames)
                 name = slug(job_name(printer))
-                if a.experimental:
-                    name += "-experimental"
                 out = Path(outdir) / f"{dt.datetime.now():%Y%m%d-%H%M}-{name}"
-                log(f"job {snap.job_id} {name!r} started")
-                job_id, sess = snap.job_id, make_session(camera, out, a)
+                job_id, sess = snap.job_id, make_session(camera, out, a, snap)
+                log(
+                    f"job {snap.job_id} {name!r} started "
+                    f"(progress {snap.progress}%, {snap.time_printing}s in, z={snap.z})"
+                )
                 sess.grab("start")
             elif sess and not snap.active:
-                sess.grab("end")
                 log(f"job {job_id} ended ({snap.state})")
                 finish(sess, fps, max_duration, keep_frames)
                 sess = None
@@ -504,7 +636,7 @@ def render(
     out: Path | str,
     fps: int = 30,
     hold: float = 2.0,
-    crf: int = 20,
+    crf: int = 25,
     max_duration: int = 20,
     gif: bool = False,
 ) -> Path:
@@ -567,11 +699,6 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     exp = argparse.ArgumentParser(add_help=False)
     exp.add_argument(
-        "--experimental",
-        action="store_true",
-        help="Pick the frame for each layer with the print head closest to --target",
-    )
-    exp.add_argument(
         "--target",
         help="pixel x,y to park the head at; default: least of the print covered",
     )
@@ -633,7 +760,9 @@ def main() -> None:
         type=float,
         help="seconds to freeze the last frame for a less abrupt ending; default 2, gif 1",
     )
-    r.add_argument("--crf", type=int, default=20)
+    r.add_argument(
+        "--crf", type=int, default=25, help="x264 quality, +3 halves the size"
+    )
     r.add_argument(
         "--max-duration",
         type=int,
@@ -641,6 +770,10 @@ def main() -> None:
     )
 
     sub.add_parser("status", help="Print PrusaLink status")
+
+    rp = sub.add_parser("replay", parents=[exp])
+    rp.add_argument("video", help="mkv with a .z.log next to it")
+    rp.add_argument("--out", help="frames directory (default: frames/<video name>)")
 
     a = ap.parse_args()
     printer = Printer(a.host, a.key, a.password, cfg["printer"]["user"])
@@ -670,6 +803,9 @@ def main() -> None:
             a.max_duration if a.max_duration is not None else (3 if a.gif else 20),
             a.gif,
         )
+    elif a.cmd == "replay":
+        video = Path(a.video)
+        replay(video, Path(a.out) if a.out else FRAMES / video.stem, a)
     elif a.cmd == "capture":
         out = Path(a.out) if a.out else FRAMES / f"{dt.datetime.now():%Y%m%d-%H%M}"
         if a.interval:
