@@ -100,6 +100,7 @@ class Print:
     frames: list[Path]
     video: Path | None
     gif: Path | None
+    poster_file: Path
 
     @property
     def token(self) -> str:
@@ -132,12 +133,10 @@ class Print:
 
     @property
     def last_activity(self) -> float:
-        # Frames only: the token backfill touches meta.json on old directories
         return self.frames[-1].stat().st_mtime if self.frames else 0
 
     @property
     def status(self) -> str:
-        # printing, done, stopped, incomplete
         if self.ended:
             state = self.meta.get("state") or "FINISHED"
             return "done" if state == "FINISHED" else "stopped"
@@ -163,11 +162,29 @@ class Print:
 
     @property
     def poster(self) -> str | None:
-        if self.frames:
-            return "latest.jpg"
+        if self.frames or self.video:
+            return "poster.jpg"
         if (self.dir / THUMB).exists():
             return "thumb.png"
         return None
+
+    @property
+    def latest(self) -> str | None:
+        return "latest.jpg" if self.frames else self.poster
+
+    def ensure_poster(self) -> Path | None:
+        stale = (
+            self.frames
+            and self.poster_file.exists()
+            and (self.poster_file.stat().st_mtime < self.frames[-1].stat().st_mtime)
+        )
+        if self.poster_file.exists() and not stale:
+            return self.poster_file
+        try:
+            return poster(self.dir, self.poster_file, self.video)
+        except subprocess.CalledProcessError as e:
+            log(f"poster failed: {e.stderr.decode(errors='replace')[-300:]}")
+            return None
 
     def facts(self) -> list[tuple[str, str]]:
         g = self.gcode
@@ -209,7 +226,6 @@ class Print:
         return out
 
     def description(self) -> str:
-        # One line for link previews
         g = self.gcode
         bits = []
         if filament := g.get("filament_settings_id") or g.get("filament_type"):
@@ -226,7 +242,6 @@ class Print:
         return " · ".join(bits)
 
     def video_size(self) -> tuple[int, int] | None:
-        # render() scales frames to even dimensions
         if self.frames and (size := jpeg_size(self.frames[-1])):
             return size[0] // 2 * 2, size[1] // 2 * 2
         return None
@@ -237,6 +252,7 @@ class Catalog:
         self.frames = base / "frames"
         self.render = base / "render"
         self.lock = threading.Lock()
+        self.poster_lock = threading.Lock()
         self.scanned = 0.0
         self.prints: list[Print] = []
         self.tokens: dict[str, Print] = {}
@@ -379,9 +395,10 @@ def page(
 """
 
 
-def card(p: Print) -> str:
+def card(p: Print, lazy: bool) -> str:
+    loading = ' loading="lazy"' if lazy else ""
     poster = (
-        f'<img src="/p/{p.token}/{p.poster}" alt="" loading="lazy">'
+        f'<img src="/p/{p.token}/{p.poster}" alt=""{loading}>'
         if p.poster
         else "no frames"
     )
@@ -420,8 +437,8 @@ def live_stats(p: Print) -> str:
 
 def hero(p: Print) -> str:
     poster = (
-        f'<img src="/p/{p.token}/{p.poster}?t={int(time.time())}" alt="">'
-        if p.poster
+        f'<img src="/p/{p.token}/{p.latest}?t={int(time.time())}" alt="">'
+        if p.latest
         else ""
     )
     return f"""<a class="hero" href="/p/{p.token}/">
@@ -437,15 +454,14 @@ def index_page(prints: list[Print]) -> str:
     if live:
         body += "<h2>Printing now</h2>" + "".join(hero(p) for p in live)
     if rest:
-        body += f"<h2>{len(rest)} prints</h2><div class='grid'>{''.join(card(p) for p in rest)}</div>"
+        cards = "".join(card(p, i >= EAGER_IMAGES) for i, p in enumerate(rest))
+        body += f"<h2>{len(rest)} prints</h2><div class='grid'>{cards}</div>"
     if not prints:
         body = '<p class="empty-state">No prints yet.</p>'
     return page("Timelapses", body, sub=f"{len(prints)} prints")
 
 
 def social(p: Print, base: str) -> str:
-    # Open Graph + Twitter card: Discord, Mastodon, Slack and friends render the
-    # mp4 inline from og:video, everything else falls back to the poster image
     url = f"{base}/p/{p.token}/"
     tags = [
         ("og:type", "video.other"),
@@ -458,9 +474,9 @@ def social(p: Print, base: str) -> str:
         ("twitter:description", p.description()),
     ]
     size = p.video_size()
-    if p.poster:
-        tags += [("og:image", url + p.poster), ("twitter:image", url + p.poster)]
-        if p.poster == "latest.jpg" and size:
+    if p.latest:
+        tags += [("og:image", url + p.latest), ("twitter:image", url + p.latest)]
+        if p.latest == "latest.jpg" and size:
             tags += [
                 ("og:image:width", str(size[0])),
                 ("og:image:height", str(size[1])),
@@ -486,17 +502,39 @@ def social(p: Print, base: str) -> str:
     )
 
 
+def scrubber(p: Print) -> str:
+    if not p.frames:
+        return ""
+    names = json.dumps([f.name for f in p.frames])
+    last = len(p.frames) - 1
+    return f"""<h2>Frame by frame</h2>
+<div class="scrub">
+  <img src="/p/{p.token}/frames/{p.frames[-1].name}" alt="">
+  <div class="bar-row"><input type="range" min="0" max="{last}" value="{last}" aria-label="Frame"><span>frame {last + 1} / {last + 1}</span></div>
+</div>
+<script>
+(() => {{
+  const frames = {names};
+  const scrub = document.querySelector('.scrub');
+  const img = scrub.querySelector('img'), range = scrub.querySelector('input'), label = scrub.querySelector('span');
+  range.addEventListener('input', () => {{
+    img.src = `/p/{p.token}/frames/${{frames[range.value]}}`;
+    label.textContent = `frame ${{+range.value + 1}} / ${{frames.length}}`;
+  }});
+}})();
+</script>"""
+
+
 def detail_page(p: Print, base: str) -> str:
     live = p.status == "printing"
     if p.video and not live:
-        poster = f' poster="/p/{p.token}/latest.jpg"' if p.frames else ""
         player = (
-            f'<video controls autoplay muted loop playsinline preload="auto"{poster}>'
+            f'<video controls autoplay muted loop playsinline preload="auto" poster="/p/{p.token}/poster.jpg">'
             f'<source src="/p/{p.token}/video.mp4" type="video/mp4"></video>'
             "<script>document.querySelector('video').play().catch(() => {});</script>"
         )
-    elif p.poster:
-        player = f'<img src="/p/{p.token}/{p.poster}?t={int(time.time())}" alt="">'
+    elif p.latest:
+        player = f'<img src="/p/{p.token}/{p.latest}?t={int(time.time())}" alt="">'
     else:
         player = '<div class="poster empty">no frames yet</div>'
     facts = "".join(f"<dt>{h(k)}</dt><dd>{v}</dd>" for k, v in p.facts())
@@ -525,7 +563,8 @@ def detail_page(p: Print, base: str) -> str:
 <div class="detail">
   <div><h1>{h(p.title)}</h1><div class="file">{h(p.file_name)}</div>{live_stats(p) if live else ""}<dl style="margin-top:{"18px" if live else "0"}">{facts}</dl></div>
   {side}
-</div>"""
+</div>
+{scrubber(p)}"""
     return page(
         p.title,
         body,
@@ -571,6 +610,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.file(p.video, "video/mp4", head, done)
         if rest == "/video.gif" and p.gif:
             return self.file(p.gif, "image/gif", head, done)
+        if rest == "/poster.jpg" and p.poster == "poster.jpg":
+            with self.catalog.poster_lock:
+                poster_file = p.ensure_poster()
+            if poster_file:
+                return self.file(poster_file, "image/jpeg", head, done)
+            return self.fail(HTTPStatus.NOT_FOUND)
         if rest == "/thumb.png" and (p.dir / THUMB).exists():
             return self.file(p.dir / THUMB, "image/png", head, done)
         if rest == "/latest.jpg" and p.frames:
@@ -586,8 +631,6 @@ class Handler(BaseHTTPRequestHandler):
         return self.fail(HTTPStatus.NOT_FOUND)
 
     def base_url(self) -> str:
-        # Absolute URLs for link previews: config wins, else the reverse proxy's
-        # forwarded headers, else whatever the client connected to
         if url := CFG["web"].get("url"):
             return str(url).rstrip("/")
         proto = self.headers.get("X-Forwarded-Proto", "http")
@@ -615,7 +658,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def file(self, path: Path, ctype: str, head: bool, immutable: bool) -> None:
-        # Range support: browsers need it to seek in (and Safari to play at all) mp4s
         size = path.stat().st_size
         start, end = 0, size - 1
         status = HTTPStatus.OK
@@ -670,7 +712,7 @@ def main() -> None:
     ap.add_argument("--host", default=CFG["web"]["host"])
     ap.add_argument("--port", type=int, default=CFG["web"]["port"])
     ap.add_argument(
-        "--base", default=str(BASE), help="directory holding frames/ and render/"
+        "--base", default=str(BASE), help="directory with frames/ and render/"
     )
     a = ap.parse_args()
     Handler.catalog = Catalog(Path(a.base))

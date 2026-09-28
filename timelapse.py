@@ -153,7 +153,6 @@ class Printer:
         return f'{auth}, qop=auth, nc={nc}, cnonce="{cnonce}", response="{resp}"'
 
     def open(self, path: str, auth: str | None = None, timeout: float = 5) -> Any:
-        # Response object, digest-authenticated on demand. Caller closes it.
         req = urllib.request.Request(
             self.base + path, headers={"Accept": "application/json"}
         )
@@ -236,9 +235,6 @@ def now() -> str:
 
 
 def bgcode_meta(stream: Any) -> tuple[dict[str, str], bytes | None]:
-    # Metadata blocks precede the gcode, so read only until the first gcode block.
-    # Returns (key=value pairs, largest PNG thumbnail).
-    # Spec: https://github.com/prusa3d/libbgcode/blob/main/doc/specifications.md
     header = stream.read(10)
     if len(header) < 10 or header[:4] != b"GCDE":
         raise ValueError("not a binary gcode file")
@@ -259,7 +255,7 @@ def bgcode_meta(stream: Any) -> tuple[dict[str, str], bytes | None]:
         if comp == 1:
             data = zlib.decompress(data)
         elif comp:
-            continue  # heatshrink, never used for metadata in practice
+            continue
         if btype == 5:
             fmt = struct.unpack("<HHH", params)[0]
             if fmt == 0 and (png is None or len(data) > len(png)):
@@ -341,7 +337,6 @@ class Session:
         return read_meta(self.out)
 
     def meta(self, **updates: Any) -> None:
-        # Merge into meta.json; the web view reads it, so write atomically
         data = self.read_meta() | updates
         tmp = self.out / (META + ".part")
         tmp.write_text(json.dumps(data, indent=1))
@@ -514,7 +509,6 @@ def make_session(camera: str, out: Path | str, snap: Snap | None) -> TrackedSess
 
 
 def record_start(sess: Session, printer: Printer, snap: Snap | None) -> None:
-    # Job facts known at print time, plus the slicer preview PrusaLink serves
     job = job_info(printer)
     file = job.get("file") or {}
     sess.meta(
@@ -645,12 +639,33 @@ def finish(
         log(f"{sess.out}: only {sess.n} frames, deleting")
         shutil.rmtree(sess.out, ignore_errors=True)
         return
+    record_end(sess, printer, state)
     try:
         render(
             sess.out, RENDER / f"{sess.out.name}.mp4", fps, max_duration=max_duration
         )
+        poster(sess.out, RENDER / f"{sess.out.name}.jpg")
     except subprocess.CalledProcessError as e:
         log(f"render failed: {e.stderr.decode(errors='replace')[-500:]}")
+
+
+def poster(frames: Path, out: Path, video: Path | None = None) -> Path | None:
+    files = sorted(Path(frames).glob("[0-9]*.jpg"))
+    if files:
+        src = ["-i", str(files[-1])]
+    elif video and video.exists():
+        src = ["-sseof", "-0.1", "-i", str(video)]
+    else:
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".part.jpg")
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "error", "-y", *src,
+        "-frames:v", "1", "-vf", f"scale={POSTER_WIDTH}:-2", "-q:v", "4", str(tmp),
+    ]  # fmt: skip
+    subprocess.run(cmd, check=True, capture_output=True)
+    tmp.rename(out)
+    return out
 
 
 def thin(files: list[Path], limit: int) -> list[Path]:
@@ -799,6 +814,13 @@ def main() -> None:
             a.max_duration if a.max_duration is not None else (3 if a.gif else 20),
             a.gif,
         )
+        if not a.gif:
+            poster(
+                frames,
+                Path(a.out).with_suffix(".jpg")
+                if a.out
+                else RENDER / f"{frames.name}.jpg",
+            )
     elif a.cmd == "capture":
         out = (
             Path(a.out)
