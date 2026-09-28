@@ -110,8 +110,8 @@ class Print:
 
     @property
     def last_activity(self) -> float:
-        paths = [self.dir / META, *self.frames[-1:]]
-        return max((p.stat().st_mtime for p in paths if p.exists()), default=0)
+        # Frames only: the token backfill touches meta.json on old directories
+        return self.frames[-1].stat().st_mtime if self.frames else 0
 
     @property
     def status(self) -> str:

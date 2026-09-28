@@ -55,7 +55,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "output": {"dir": str(Path(__file__).resolve().parent)},
     "web": {"host": "127.0.0.1", "port": 8811},
 }
-ACTIVE = {"PRINTING", "PAUSED", "ATTENTION"}
+ACTIVE = {"PRINTING", "PAUSED", "ATTENTION", "BUSY"}  # BUSY: transient mid-job
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
 END_LIFT = 5
 FIRST_LAYER_MAX = 1.0
