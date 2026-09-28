@@ -73,6 +73,7 @@ FPS = 30
 HOLD = 1.0  # seconds the last frame stays
 MAX_DURATION = 20
 SHORT_DURATION = 5
+SHORT_MARGIN = 1.5
 GIF_WIDTH = 640
 STREAM_FPS = 6
 BG_SAMPLES = 40  # frames per layer
@@ -737,9 +738,8 @@ def render_set(
     short = out.with_name(out.stem + ".short.mp4")
     files = sorted(frames.glob("*.jpg"))
     cuts = {"full": (out, max_duration)}
-    if len(files) > fps * SHORT_DURATION and (
-        not max_duration or max_duration > SHORT_DURATION
-    ):
+    full_seconds = len(thin(files, fps * max_duration if max_duration else 0)) / fps
+    if full_seconds >= SHORT_DURATION + SHORT_MARGIN:
         cuts["short"] = (short, SHORT_DURATION)
     else:
         short.unlink(missing_ok=True)
