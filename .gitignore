@@ -1,0 +1,5 @@
+frames/
+logs/
+render/
+.mypy_cache/
+.ruff_cache/
