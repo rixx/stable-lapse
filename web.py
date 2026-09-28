@@ -354,19 +354,16 @@ MARK = '<span class="mark"><svg viewBox="0 0 16 16"><path d="M3 2.5v11l10-5.5z"/
 def page(
     title: str,
     body: str,
-    refresh: int = 0,
     sub: str = "",
     brand: str = "Timelapses",
     head: str = "",
 ) -> str:
-    meta_refresh = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{h(title)}</title>
-{meta_refresh}
 {head}
 <link rel="icon" href="data:image/svg+xml,{urllib.parse.quote('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="4" fill="#fa6831"/><path d="M5 3.5v9l7-4.5z" fill="#fff"/></svg>')}">
 <style>{CSS}</style>
@@ -443,9 +440,7 @@ def index_page(prints: list[Print]) -> str:
         body += f"<h2>{len(rest)} prints</h2><div class='grid'>{''.join(card(p) for p in rest)}</div>"
     if not prints:
         body = '<p class="empty-state">No prints yet.</p>'
-    return page(
-        "Timelapses", body, refresh=60 if live else 0, sub=f"{len(prints)} prints"
-    )
+    return page("Timelapses", body, sub=f"{len(prints)} prints")
 
 
 def social(p: Print, base: str) -> str:
@@ -534,7 +529,6 @@ def detail_page(p: Print, base: str) -> str:
     return page(
         p.title,
         body,
-        refresh=60 if live else 0,
         sub=f"{p.started:%d %b %Y}",
         brand="Timelapse",
         head=social(p, base),
