@@ -34,6 +34,7 @@ from timelapse import BASE, CFG, META, MIN_FRAMES, THUMB, log, poster, read_meta
 
 REPO = "https://github.com/rixx/stable-lapse"
 EAGER_IMAGES = 12
+DELETE_AFTER = 86400
 LIVE_WINDOW = 900
 SCAN_TTL = 3
 PRINTERS = {
@@ -57,7 +58,7 @@ def profile(name: str) -> str:
 
 
 def duration(seconds: float | None) -> str:
-    if seconds is None:
+    if seconds is None or seconds < 0:
         return ""
     s = int(seconds)
     if s < 60:
@@ -150,8 +151,9 @@ class Print:
 
     @property
     def print_time(self) -> float | None:
-        if self.meta.get("joined_late") or not self.ended:
-            return self.meta.get("time_printing")
+        printing = self.meta.get("time_printing")
+        if self.meta.get("joined_late") or not self.ended or printing:
+            return printing
         return (self.ended - self.started).total_seconds()
 
     @property
@@ -277,7 +279,7 @@ class Catalog:
             gif = self.render / f"{d.name}.gif"
             if not video.exists() and len(frames) < MIN_FRAMES:
                 newest = max([d, *frames], key=lambda f: f.stat().st_mtime)
-                if time.time() - newest.stat().st_mtime > LIVE_WINDOW:
+                if time.time() - newest.stat().st_mtime > DELETE_AFTER:
                     log(f"{d.name}: {len(frames)} frames, no video, deleting")
                     shutil.rmtree(d, ignore_errors=True)
                     continue
@@ -520,7 +522,7 @@ def social(p: Print, base: str) -> str:
 
 
 def scrubber(p: Print) -> str:
-    if not p.frames:
+    if len(p.frames) < 2:
         return ""
     names = json.dumps([f.name for f in p.frames])
     last = len(p.frames) - 1
