@@ -16,7 +16,9 @@ import html
 import json
 import re
 import secrets
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -28,10 +30,11 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from timelapse import BASE, CFG, META, THUMB, log, read_meta, slug
+from timelapse import BASE, CFG, META, MIN_FRAMES, THUMB, log, poster, read_meta, slug
 
 REPO = "https://github.com/rixx/stable-lapse"
-LIVE_WINDOW = 900  # seconds without a new frame after which a print counts as abandoned
+EAGER_IMAGES = 12
+LIVE_WINDOW = 900
 SCAN_TTL = 3
 PRINTERS = {
     "COREONE": "Prusa CORE One",
@@ -67,7 +70,6 @@ def duration(seconds: float | None) -> str:
 
 
 def jpeg_size(path: Path) -> tuple[int, int] | None:
-    # Walk the JPEG segments to the first SOF marker
     try:
         with path.open("rb") as f:
             if f.read(2) != b"\xff\xd8":
@@ -218,7 +220,10 @@ class Print:
         if printed := duration(self.print_time):
             estimate = g.get("estimated printing time (normal mode)")
             out.append(
-                ("Print time", h(printed + (f" (est. {estimate})" if estimate else "")))
+                (
+                    "Print time",
+                    h(printed + (f" (est. {estimate})" if estimate else "")),
+                )
             )
         elif estimate := g.get("estimated printing time (normal mode)"):
             out.append(("Estimated time", h(estimate)))
@@ -270,6 +275,12 @@ class Catalog:
             frames = sorted(d.glob("[0-9]*.jpg"))
             video = self.render / f"{d.name}.mp4"
             gif = self.render / f"{d.name}.gif"
+            if not video.exists() and len(frames) < MIN_FRAMES:
+                newest = max([d, *frames], key=lambda f: f.stat().st_mtime)
+                if time.time() - newest.stat().st_mtime > LIVE_WINDOW:
+                    log(f"{d.name}: {len(frames)} frames, no video, deleting")
+                    shutil.rmtree(d, ignore_errors=True)
+                    continue
             prints.append(
                 Print(
                     d,
@@ -277,6 +288,7 @@ class Catalog:
                     frames,
                     video if video.exists() else None,
                     gif if gif.exists() else None,
+                    self.render / f"{d.name}.jpg",
                 )
             )
         prints.sort(key=lambda p: p.started, reverse=True)
@@ -355,6 +367,11 @@ dd { margin: 0; display: flex; align-items: center; gap: 8px; }
 .btn:hover { background: var(--orange-dark); }
 .btn.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
 .btn.ghost:hover { border-color: var(--orange); color: var(--orange); }
+.scrub { background: var(--card); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
+.scrub img { width: 100%; display: block; background: #000; max-height: 78vh; object-fit: contain; }
+.bar-row { display: flex; align-items: center; gap: 16px; padding: 12px 16px; }
+.bar-row input { flex: 1; accent-color: var(--orange); margin: 0; }
+.bar-row span { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .empty-state { text-align: center; color: var(--muted); padding: 80px 0; }
 footer { max-width: 1100px; margin: 0 auto; padding: 0 20px 24px; color: var(--muted); font-size: 12px; }
 footer a:hover { color: var(--orange); }
