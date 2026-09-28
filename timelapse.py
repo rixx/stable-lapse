@@ -55,7 +55,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "host": "127.0.0.1",
         "port": 8811,
         "url": "",
-    },  # url: public base for link previews
+        "tz": "",
+    },
 }
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION", "BUSY"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer

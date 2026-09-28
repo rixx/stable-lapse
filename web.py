@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zoneinfo
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from timelapse import BASE, CFG, META, MIN_FRAMES, THUMB, log, poster, read_meta, slug
 
 REPO = "https://github.com/rixx/stable-lapse"
+TZ = zoneinfo.ZoneInfo(CFG["web"]["tz"]) if CFG["web"].get("tz") else None
 EAGER_IMAGES = 12
 DELETE_AFTER = 86400
 LIVE_WINDOW = 900
@@ -123,10 +125,10 @@ class Print:
     @property
     def started(self) -> dt.datetime:
         if started := parse_dt(self.meta.get("started")):
-            return started
+            return started.astimezone(TZ)
         try:
             stamp = dt.datetime.strptime(self.dir.name[:13], "%Y%m%d-%H%M")  # noqa: DTZ007
-            return stamp.astimezone()
+            return stamp.replace(tzinfo=TZ or dt.datetime.now().astimezone().tzinfo)
         except ValueError:
             return dt.datetime.fromtimestamp(self.dir.stat().st_mtime).astimezone()
 
@@ -219,6 +221,8 @@ class Print:
             out.append(("Profile", h(profile(profile_name))))
         if grams := g.get("total filament used [g]") or g.get("filament used [g]"):
             out.append(("Filament used", h(f"{grams} g")))
+        if self.status == "printing":
+            return out
         out.append(("Layers", h(self.layers)))
         if printed := duration(self.print_time):
             estimate = g.get("estimated printing time (normal mode)")
@@ -574,11 +578,9 @@ def detail_page(p: Print, base: str) -> str:
         if (p.dir / THUMB).exists()
         else ""
     )
-    side = (
-        f'<div class="side">{thumb}<div class="actions">{actions}</div></div>'
-        if thumb or actions
-        else ""
-    )
+    if actions:
+        actions = f'<div class="actions">{actions}</div>'
+    side = f'<div class="side">{thumb}{actions}</div>' if thumb or actions else ""
     body = f"""<div class="player">{player}</div>
 <div class="detail">
   <div><h1>{h(p.title)}</h1><div class="file">{h(p.file_name)}</div>{live_stats(p) if live else ""}<dl style="margin-top:{"18px" if live else "0"}">{facts}</dl></div>
