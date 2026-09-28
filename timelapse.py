@@ -53,7 +53,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "camera": {"url": "rtsp://192.168.4.133/live"},
     "printer": {"host": "192.168.4.101", "key": "", "password": "", "user": "maker"},
     "output": {"dir": str(Path(__file__).resolve().parent)},
-    "web": {"host": "127.0.0.1", "port": 8811},
+    "web": {
+        "host": "127.0.0.1",
+        "port": 8811,
+        "url": "",
+    },  # url: public base for link previews
 }
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION", "BUSY"}  # BUSY: transient mid-job
 Z_STEP = 0.05  # minimum z rise that counts as a new layer

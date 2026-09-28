@@ -16,6 +16,7 @@ import html
 import json
 import re
 import secrets
+import struct
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from timelapse import BASE, CFG, META, THUMB, log, read_meta, slug
 
+REPO = "https://github.com/rixx/stable-lapse"
 LIVE_WINDOW = 900  # seconds without a new frame after which a print counts as abandoned
 SCAN_TTL = 3
 PRINTERS = {
@@ -62,6 +64,26 @@ def duration(seconds: float | None) -> str:
     if s < 86400:
         return f"{s // 3600}h {s % 3600 // 60:02d}m"
     return f"{s // 86400}d {s % 86400 // 3600}h"
+
+
+def jpeg_size(path: Path) -> tuple[int, int] | None:
+    # Walk the JPEG segments to the first SOF marker
+    try:
+        with path.open("rb") as f:
+            if f.read(2) != b"\xff\xd8":
+                return None
+            while True:
+                marker, length = struct.unpack(">HH", f.read(4))
+                if 0xFFC0 <= marker <= 0xFFCF and marker not in (
+                    0xFFC4,
+                    0xFFC8,
+                    0xFFCC,
+                ):
+                    _, height, width = struct.unpack(">BHH", f.read(5))
+                    return width, height
+                f.seek(length - 2, 1)
+    except (OSError, struct.error):
+        return None
 
 
 def parse_dt(value: Any) -> dt.datetime | None:
@@ -186,6 +208,29 @@ class Print:
         out.append(("Started", h(f"{self.started:%d %b %Y, %H:%M}")))
         return out
 
+    def description(self) -> str:
+        # One line for link previews
+        g = self.gcode
+        bits = []
+        if filament := g.get("filament_settings_id") or g.get("filament_type"):
+            bits.append(profile(filament))
+        if layer := g.get("layer_height"):
+            bits.append(f"{layer} mm layers")
+        if self.layers:
+            bits.append(f"{self.layers} layers")
+        if printed := duration(self.print_time):
+            bits.append(printed)
+        if model := g.get("printer_model"):
+            bits.append(PRINTERS.get(model, model))
+        bits.append(f"{self.started:%d %b %Y}")
+        return " · ".join(bits)
+
+    def video_size(self) -> tuple[int, int] | None:
+        # render() scales frames to even dimensions
+        if self.frames and (size := jpeg_size(self.frames[-1])):
+            return size[0] // 2 * 2, size[1] // 2 * 2
+        return None
+
 
 class Catalog:
     def __init__(self, base: Path):
@@ -296,6 +341,7 @@ dd { margin: 0; display: flex; align-items: center; gap: 8px; }
 .btn.ghost:hover { border-color: var(--orange); color: var(--orange); }
 .empty-state { text-align: center; color: var(--muted); padding: 80px 0; }
 footer { max-width: 1100px; margin: 0 auto; padding: 0 20px 24px; color: var(--muted); font-size: 12px; }
+footer a:hover { color: var(--orange); }
 @media (max-width: 760px) {
   .hero, .detail { grid-template-columns: 1fr; }
   .detail .side { order: 2; }
@@ -306,7 +352,12 @@ MARK = '<span class="mark"><svg viewBox="0 0 16 16"><path d="M3 2.5v11l10-5.5z"/
 
 
 def page(
-    title: str, body: str, refresh: int = 0, sub: str = "", brand: str = "Timelapses"
+    title: str,
+    body: str,
+    refresh: int = 0,
+    sub: str = "",
+    brand: str = "Timelapses",
+    head: str = "",
 ) -> str:
     meta_refresh = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html>
@@ -316,6 +367,7 @@ def page(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{h(title)}</title>
 {meta_refresh}
+{head}
 <link rel="icon" href="data:image/svg+xml,{urllib.parse.quote('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="4" fill="#fa6831"/><path d="M5 3.5v9l7-4.5z" fill="#fff"/></svg>')}">
 <style>{CSS}</style>
 </head>
@@ -324,7 +376,7 @@ def page(
 <main>
 {body}
 </main>
-<footer>stable-lapse</footer>
+<footer><a href="{REPO}">stable-lapse</a></footer>
 </body>
 </html>
 """
@@ -396,7 +448,50 @@ def index_page(prints: list[Print]) -> str:
     )
 
 
-def detail_page(p: Print) -> str:
+def social(p: Print, base: str) -> str:
+    # Open Graph + Twitter card: Discord, Mastodon, Slack and friends render the
+    # mp4 inline from og:video, everything else falls back to the poster image
+    url = f"{base}/p/{p.token}/"
+    tags = [
+        ("og:type", "video.other"),
+        ("og:site_name", "stable-lapse"),
+        ("og:title", p.title),
+        ("og:description", p.description()),
+        ("og:url", url),
+        ("twitter:card", "summary_large_image"),
+        ("twitter:title", p.title),
+        ("twitter:description", p.description()),
+    ]
+    size = p.video_size()
+    if p.poster:
+        tags += [("og:image", url + p.poster), ("twitter:image", url + p.poster)]
+        if p.poster == "latest.jpg" and size:
+            tags += [
+                ("og:image:width", str(size[0])),
+                ("og:image:height", str(size[1])),
+            ]
+    if p.video and p.status != "printing":
+        video = url + "video.mp4"
+        tags += [
+            ("og:video", video),
+            ("og:video:secure_url", video),
+            ("og:video:type", "video/mp4"),
+        ]
+        if size:
+            tags += [
+                ("og:video:width", str(size[0])),
+                ("og:video:height", str(size[1])),
+            ]
+    return (
+        "\n".join(
+            f'<meta {"name" if k.startswith("twitter:") else "property"}="{k}" content="{h(v)}">'
+            for k, v in tags
+        )
+        + f'\n<meta name="description" content="{h(p.description())}">'
+    )
+
+
+def detail_page(p: Print, base: str) -> str:
     live = p.status == "printing"
     if p.video and not live:
         poster = f' poster="/p/{p.token}/latest.jpg"' if p.frames else ""
@@ -442,6 +537,7 @@ def detail_page(p: Print) -> str:
         refresh=60 if live else 0,
         sub=f"{p.started:%d %b %Y}",
         brand="Timelapse",
+        head=social(p, base),
     )
 
 
@@ -476,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return None
         if rest == "/":
-            return self.html(detail_page(p), head)
+            return self.html(detail_page(p, self.base_url()), head)
         if rest == "/video.mp4" and p.video:
             return self.file(p.video, "video/mp4", head, done)
         if rest == "/video.gif" and p.gif:
@@ -494,6 +590,15 @@ class Handler(BaseHTTPRequestHandler):
             if frame.exists():
                 return self.file(frame, "image/jpeg", head, done)
         return self.fail(HTTPStatus.NOT_FOUND)
+
+    def base_url(self) -> str:
+        # Absolute URLs for link previews: config wins, else the reverse proxy's
+        # forwarded headers, else whatever the client connected to
+        if url := CFG["web"].get("url"):
+            return str(url).rstrip("/")
+        proto = self.headers.get("X-Forwarded-Proto", "http")
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+        return f"{proto}://{host}"
 
     def fail(self, status: HTTPStatus) -> None:
         body = f"{status.value} {status.phrase}\n".encode()
