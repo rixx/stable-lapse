@@ -65,7 +65,7 @@ LOGFILE: Path | None = None
 
 
 def log(msg: str) -> None:
-    line = f"{dt.datetime.now():%H:%M:%S} {msg}"
+    line = f"{dt.datetime.now().astimezone():%H:%M:%S} {msg}"
     print(line, file=sys.stderr, flush=True)
     if LOGFILE:
         with LOGFILE.open("a") as f:
@@ -457,7 +457,10 @@ def watch(
                 if sess:
                     finish(sess, fps, max_duration)
                 name = slug(job_name(printer))
-                out = Path(outdir) / f"{dt.datetime.now():%Y%m%d-%H%M}-{name}"
+                out = (
+                    Path(outdir)
+                    / f"{dt.datetime.now().astimezone():%Y%m%d-%H%M}-{name}"
+                )
                 job_id, sess = snap.job_id, make_session(camera, out, snap)
                 log(
                     f"job {snap.job_id} {name!r} started "
@@ -633,7 +636,11 @@ def main() -> None:
             a.gif,
         )
     elif a.cmd == "capture":
-        out = Path(a.out) if a.out else FRAMES / f"{dt.datetime.now():%Y%m%d-%H%M}"
+        out = (
+            Path(a.out)
+            if a.out
+            else FRAMES / f"{dt.datetime.now().astimezone():%Y%m%d-%H%M}"
+        )
         if a.interval:
             capture_interval(a.camera, out, a.interval, a.duration)
         else:

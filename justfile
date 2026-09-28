@@ -23,3 +23,33 @@ render dir *args:
 # Print PrusaLink status
 status:
     "{{ script }}" status
+
+# Run ruff format, ruff check --fix, and mypy
+[group('linting')]
+fmt: format (check "--fix") mypy && fmt-done
+
+# Run formatters and linters in check mode
+[group('linting')]
+fmt-check: (format "--check") check mypy && check-done
+
+[private]
+format *args="":
+    uvx ruff format {{ args }} "{{ script }}"
+
+[private]
+check *args="":
+    uvx ruff check {{ args }} "{{ script }}"
+
+# mypy against the script's own uv environment, so numpy and cv2 resolve
+[private]
+mypy:
+    uv sync --script "{{ script }}" --quiet
+    uvx mypy --python-executable "$(uv python find --script "{{ script }}")" "{{ script }}"
+
+[private]
+fmt-done:
+    echo '{{ GREEN }}Formatting complete{{ NORMAL }}'
+
+[private]
+check-done:
+    echo '{{ GREEN }}All checks passed{{ NORMAL }}'
