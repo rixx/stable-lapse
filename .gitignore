@@ -1,4 +1,5 @@
 frames/
+prints/
 logs/
 render/
 .mypy_cache/

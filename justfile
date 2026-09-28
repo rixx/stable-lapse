@@ -16,7 +16,7 @@ watch *args:
 capture *args:
     "{{ script }}" capture {{ args }}
 
-# Render frames to mp4. --gif for a gif
+# Render a print dir to mp4 (plus short cut and poster). --gif for a gif
 [no-cd]
 render dir *args:
     "{{ script }}" render "{{ dir }}" {{ args }}

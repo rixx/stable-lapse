@@ -10,9 +10,13 @@ and the gantry as much out of the way as possible).
 Usage: timelapse.py [command]
     capture  grab frames right now (per layer via PrusaLink, or per --interval)
     watch    wait for print jobs, capture each one per layer, render on finish
-    render   build an mp4 or gif for a frames directory
-    rerender render every finished frames directory again (after a defaults change)
+    render   build an mp4 or gif for a print directory
+    rerender render every finished print again (after a defaults change)
     status   one PrusaLink status line
+
+Layout: one directory per print under <output dir>/prints/<date>-<name>/ with
+frames/*.jpg, meta.json, thumb.png, the rendered video.mp4 (plus video.short.mp4
+for longer prints), poster.jpg and capture.log.
 
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
     [printer]
@@ -108,7 +112,15 @@ def load_config() -> dict[str, dict[str, Any]]:
 
 CFG = load_config()
 BASE = Path(CFG["output"]["dir"])
-FRAMES, LOGS, RENDER = BASE / "frames", BASE / "logs", BASE / "render"
+PRINTS = BASE / "prints"
+FRAMES_DIR = "frames"
+VIDEO, SHORT, GIF, POSTER = "video.mp4", "video.short.mp4", "video.gif", "poster.jpg"
+CAPTURE_LOG = "capture.log"
+
+
+def frames_of(d: Path) -> Path:
+    # A print directory keeps its frames in frames/, a bare frames directory is fine too
+    return d / FRAMES_DIR if (d / FRAMES_DIR).is_dir() else d
 
 
 def grab(url: str, dest: Path, timeout: float = 20) -> bool:
@@ -333,11 +345,11 @@ class Session:
         global LOGFILE
         self.camera = camera
         self.out = Path(out)
-        self.out.mkdir(parents=True, exist_ok=True)
-        self.n = len(list(self.out.glob("[0-9]*.jpg")))
+        self.frames = self.out / FRAMES_DIR
+        self.frames.mkdir(parents=True, exist_ok=True)
+        self.n = len(list(self.frames.glob("[0-9]*.jpg")))
         self.last_t = 0.0
-        LOGS.mkdir(parents=True, exist_ok=True)
-        LOGFILE = LOGS / f"{self.out.name}.log"
+        LOGFILE = self.out / CAPTURE_LOG
         if "token" not in self.read_meta():
             self.meta(token=secrets.token_urlsafe(9))
 
@@ -353,7 +365,7 @@ class Session:
 
     def grab(self, why: str = "") -> bool:
         started = time.monotonic()
-        if grab(self.camera, self.out / f"{self.n:05d}.jpg"):
+        if grab(self.camera, self.frames / f"{self.n:05d}.jpg"):
             self.last_t = started
             self.saved(why)
             return True
@@ -479,7 +491,7 @@ class TrackedSession(Session):
         return covered, f"covered={covered:.2f}"
 
     def _write(self, jpg: bytes, why: str) -> bool:
-        (self.out / f"{self.n:05d}.jpg").write_bytes(jpg)
+        (self.frames / f"{self.n:05d}.jpg").write_bytes(jpg)
         self.saved(why)
         return True
 
@@ -726,15 +738,17 @@ def render(
 
 
 def render_set(
-    frames: Path | str,
+    print_dir: Path | str,
     out: Path | str | None = None,
     fps: int = FPS,
     hold: float = HOLD,
     crf: int = 25,
     max_duration: int = MAX_DURATION,
 ) -> dict[str, Path]:
-    frames = Path(frames)
-    out = Path(out) if out else RENDER / f"{frames.name}.mp4"
+    print_dir = Path(print_dir)
+    frames = frames_of(print_dir)
+    poster_out = Path(out).with_suffix(".jpg") if out else print_dir / POSTER
+    out = Path(out) if out else print_dir / VIDEO
     short = out.with_name(out.stem + ".short.mp4")
     files = sorted(frames.glob("*.jpg"))
     cuts = {"full": (out, max_duration)}
@@ -749,14 +763,14 @@ def render_set(
         done[name] = render(frames, path, fps, hold, crf, limit)
         n = len(thin(files, fps * limit if limit else 0))
         info[name] = {"frames": n, "seconds": round(n / fps + hold, 1)}
-    poster(frames, out.with_suffix(".jpg"))
-    write_meta(frames, renders=info)
+    poster(frames, poster_out)
+    write_meta(print_dir, renders=info)
     return done
 
 
 def rerender(fps: int, hold: float, crf: int, max_duration: int, force: bool) -> None:
-    for d in sorted(FRAMES.iterdir()) if FRAMES.is_dir() else []:
-        files = sorted(d.glob("[0-9]*.jpg")) if d.is_dir() else []
+    for d in sorted(PRINTS.iterdir()) if PRINTS.is_dir() else []:
+        files = sorted(frames_of(d).glob("[0-9]*.jpg")) if d.is_dir() else []
         if len(files) < MIN_FRAMES:
             log(f"{d.name}: {len(files)} frames, keeping the existing render")
             continue
@@ -782,7 +796,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("capture", help="Grab frames now")
-    c.add_argument("--out", help="frames directory (default: frames/<timestamp>)")
+    c.add_argument("--out", help="print directory (default: prints/<timestamp>)")
     c.add_argument(
         "--interval",
         type=float,
@@ -801,7 +815,7 @@ def main() -> None:
     w = sub.add_parser(
         "watch", help="Run as daemon, create one timelapse per print job"
     )
-    w.add_argument("--outdir", default=str(FRAMES))
+    w.add_argument("--outdir", default=str(PRINTS))
     w.add_argument("--fps", type=int, default=FPS)
     w.add_argument(
         "--max-duration",
@@ -815,14 +829,14 @@ def main() -> None:
         "render",
         help=f"Render an mp4, plus a {SHORT_DURATION}s cut for longer prints",
     )
-    r.add_argument("frames")
-    r.add_argument("--out", help="default: render/<frames dir name>.mp4 or .gif")
+    r.add_argument("dir", help="print directory (or a bare directory of jpgs)")
+    r.add_argument("--out", help=f"default: <dir>/{VIDEO} or {GIF}")
     r.add_argument(
         "--gif",
         action="store_true",
         help=f"{GIF_WIDTH}px wide looping gif instead of mp4",
     )
-    rr = sub.add_parser("rerender", help="Render every finished frames directory again")
+    rr = sub.add_parser("rerender", help="Render every finished print again")
     rr.add_argument(
         "--force", action="store_true", help="include directories still capturing"
     )
@@ -864,13 +878,13 @@ def main() -> None:
             f"left={j.get('time_remaining')}s nozzle={p.get('temp_nozzle')} bed={p.get('temp_bed')}"
         )
     elif a.cmd == "render":
-        frames = Path(a.frames)
-        if not frames.is_dir() and (FRAMES / a.frames).is_dir():
-            frames = FRAMES / a.frames
+        d = Path(a.dir)
+        if not d.is_dir() and (PRINTS / a.dir).is_dir():
+            d = PRINTS / a.dir
         if a.gif:
             render(
-                frames,
-                a.out or RENDER / f"{frames.name}.gif",
+                frames_of(d),
+                a.out or d / GIF,
                 a.fps or 10,
                 a.hold,
                 a.crf,
@@ -879,7 +893,7 @@ def main() -> None:
             )
         else:
             render_set(
-                frames,
+                d,
                 a.out,
                 a.fps or FPS,
                 a.hold,
@@ -898,7 +912,7 @@ def main() -> None:
         out = (
             Path(a.out)
             if a.out
-            else FRAMES / f"{dt.datetime.now().astimezone():%Y%m%d-%H%M}"
+            else PRINTS / f"{dt.datetime.now().astimezone():%Y%m%d-%H%M}"
         )
         if a.interval:
             capture_interval(a.camera, out, a.interval, a.duration)

@@ -34,10 +34,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from timelapse import (
     BASE,
     CFG,
+    FRAMES_DIR,
+    GIF,
     LIVE_WINDOW,
     META,
     MIN_FRAMES,
+    POSTER,
+    SHORT,
     THUMB,
+    VIDEO,
     log,
     poster,
     read_meta,
@@ -220,7 +225,7 @@ class Print:
         if self.poster_file.exists() and not stale:
             return self.poster_file
         try:
-            return poster(self.dir, self.poster_file, self.video)
+            return poster(self.dir / FRAMES_DIR, self.poster_file, self.video)
         except subprocess.CalledProcessError as e:
             log(f"poster failed: {e.stderr.decode(errors='replace')[-300:]}")
             return None
@@ -293,8 +298,7 @@ class Print:
 
 class Catalog:
     def __init__(self, base: Path):
-        self.frames = base / "frames"
-        self.render = base / "render"
+        self.dir = base / "prints"
         self.lock = threading.Lock()
         self.poster_lock = threading.Lock()
         self.scanned = 0.0
@@ -303,7 +307,7 @@ class Catalog:
 
     def scan(self) -> None:
         prints = []
-        for d in self.frames.iterdir() if self.frames.is_dir() else []:
+        for d in self.dir.iterdir() if self.dir.is_dir() else []:
             if not d.is_dir():
                 continue
             meta = read_meta(d)
@@ -311,10 +315,8 @@ class Catalog:
                 meta["token"] = secrets.token_urlsafe(9)
                 (d / META).write_text(json.dumps(meta, indent=1))
                 log(f"{d.name}: new token")
-            frames = sorted(d.glob("[0-9]*.jpg"))
-            video = self.render / f"{d.name}.mp4"
-            short = self.render / f"{d.name}.short.mp4"
-            gif = self.render / f"{d.name}.gif"
+            frames = sorted((d / FRAMES_DIR).glob("[0-9]*.jpg"))
+            video, short, gif = d / VIDEO, d / SHORT, d / GIF
             if not video.exists() and len(frames) < MIN_FRAMES:
                 newest = max([d, *frames], key=lambda f: f.stat().st_mtime)
                 if time.time() - newest.stat().st_mtime > DELETE_AFTER:
@@ -329,7 +331,7 @@ class Catalog:
                     video if video.exists() else None,
                     short if short.exists() and video.exists() else None,
                     gif if gif.exists() else None,
-                    self.render / f"{d.name}.jpg",
+                    d / POSTER,
                 )
             )
         prints.sort(key=lambda p: p.started, reverse=True)
@@ -742,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
         if rest == "/meta.json":
             return self.html(json.dumps(p.meta, indent=1), head, "application/json")
         if fm := re.fullmatch(r"/frames/(\d{5})\.jpg", rest):
-            frame = p.dir / f"{fm[1]}.jpg"
+            frame = p.dir / FRAMES_DIR / f"{fm[1]}.jpg"
             if frame.exists():
                 return self.file(frame, "image/jpeg", head, done)
         return self.fail(HTTPStatus.NOT_FOUND)
@@ -828,9 +830,7 @@ def main() -> None:
     )
     ap.add_argument("--host", default=CFG["web"]["host"])
     ap.add_argument("--port", type=int, default=CFG["web"]["port"])
-    ap.add_argument(
-        "--base", default=str(BASE), help="directory with frames/ and render/"
-    )
+    ap.add_argument("--base", default=str(BASE), help="directory with prints/")
     a = ap.parse_args()
     Handler.catalog = Catalog(Path(a.base))
     server = ThreadingHTTPServer((a.host, a.port), Handler)
