@@ -13,9 +13,6 @@ Usage: timelapse.py [command]
     render   build an mp4 or gif for a frames directory
     status   one PrusaLink status line
 
-Each frames directory gets a meta.json (job, file, progress, slicer settings read from
-the bgcode after the print) and thumb.png (slicer preview). web.py serves them.
-
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
     [printer]
     host = 192.168....
@@ -31,6 +28,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
@@ -59,12 +57,14 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "url": "",
     },  # url: public base for link previews
 }
-ACTIVE = {"PRINTING", "PAUSED", "ATTENTION", "BUSY"}  # BUSY: transient mid-job
+ACTIVE = {"PRINTING", "PAUSED", "ATTENTION", "BUSY"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
 END_LIFT = 5
 FIRST_LAYER_MAX = 1.0
 STABLE_POLLS = 3
 MIN_LAYERS = 3
+MIN_FRAMES = 10
+POSTER_WIDTH = 640
 JOIN_GRACE = 600  # seconds into a job after which no start-up gate applies
 GIF_WIDTH = 640
 STREAM_FPS = 6
@@ -641,9 +641,9 @@ def finish(
     sess: Session, printer: Printer, state: str | None, fps: int, max_duration: int
 ) -> None:
     sess.close()
-    record_end(sess, printer, state)
-    if sess.n < 2:
-        log(f"{sess.out}: only {sess.n} frames, not rendering")
+    if sess.n < MIN_FRAMES:
+        log(f"{sess.out}: only {sess.n} frames, deleting")
+        shutil.rmtree(sess.out, ignore_errors=True)
         return
     try:
         render(
