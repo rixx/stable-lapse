@@ -4,6 +4,7 @@ set fallback
 set default-list
 
 script := justfile_directory() / "timelapse.py"
+web := justfile_directory() / "web.py"
 
 alias run := watch
 
@@ -24,6 +25,10 @@ render dir *args:
 status:
     "{{ script }}" status
 
+# Web view: index at /, shareable detail pages at /p/<token>/
+serve *args:
+    "{{ web }}" {{ args }}
+
 # Run ruff format, ruff check --fix, and mypy
 [group('linting')]
 fmt: format (check "--fix") mypy && fmt-done
@@ -34,17 +39,17 @@ fmt-check: (format "--check") check mypy && check-done
 
 [private]
 format *args="":
-    uvx ruff format {{ args }} "{{ script }}"
+    uvx ruff format {{ args }} "{{ script }}" "{{ web }}"
 
 [private]
 check *args="":
-    uvx ruff check {{ args }} "{{ script }}"
+    uvx ruff check {{ args }} "{{ script }}" "{{ web }}"
 
 # mypy against the script's own uv environment, so numpy and cv2 resolve
 [private]
 mypy:
     uv sync --script "{{ script }}" --quiet
-    uvx mypy --python-executable "$(uv python find --script "{{ script }}")" "{{ script }}"
+    uvx mypy --python-executable "$(uv python find --script "{{ script }}")" "{{ script }}" "{{ web }}"
 
 [private]
 fmt-done:

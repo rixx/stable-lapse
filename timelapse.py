@@ -13,6 +13,9 @@ Usage: timelapse.py [command]
     render   build an mp4 or gif for a frames directory
     status   one PrusaLink status line
 
+Each frames directory gets a meta.json (job, file, progress, slicer settings read from
+the bgcode after the print) and thumb.png (slicer preview). web.py serves them.
+
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
     [printer]
     host = 192.168....
@@ -27,12 +30,15 @@ import json
 import os
 import random
 import re
+import secrets
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -43,10 +49,11 @@ CONFIG = (
     Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
     / "print-timelapse.toml"
 )
-DEFAULTS = {
+DEFAULTS: dict[str, dict[str, Any]] = {
     "camera": {"url": "rtsp://192.168.4.133/live"},
     "printer": {"host": "192.168.4.101", "key": "", "password": "", "user": "maker"},
     "output": {"dir": str(Path(__file__).resolve().parent)},
+    "web": {"host": "127.0.0.1", "port": 8811},
 }
 ACTIVE = {"PRINTING", "PAUSED", "ATTENTION"}
 Z_STEP = 0.05  # minimum z rise that counts as a new layer
@@ -59,6 +66,13 @@ GIF_WIDTH = 640
 STREAM_FPS = 6
 BG_SAMPLES = 40  # frames per layer
 BG_DIFF = 0.8  # normalised grey difference that counts as covered
+THUMB = "thumb.png"
+META = "meta.json"
+SLICER_KEYS = {
+    "filament_colour", "filament_settings_id", "print_settings_id",
+    "printer_settings_id", "first_layer_height", "fill_pattern", "perimeters",
+    "top_solid_layers", "bottom_solid_layers", "support_material_style",
+}  # fmt: skip
 
 
 LOGFILE: Path | None = None
@@ -134,7 +148,8 @@ class Printer:
         resp = h(f"{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")
         return f'{auth}, qop=auth, nc={nc}, cnonce="{cnonce}", response="{resp}"'
 
-    def get(self, path: str, auth: str | None = None) -> dict[str, Any]:
+    def open(self, path: str, auth: str | None = None, timeout: float = 5) -> Any:
+        # Response object, digest-authenticated on demand. Caller closes it.
         req = urllib.request.Request(
             self.base + path, headers={"Accept": "application/json"}
         )
@@ -143,8 +158,7 @@ class Printer:
         if auth:
             req.add_header("Authorization", auth)
         try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                return json.load(r) if r.status != 204 else {}
+            return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             challenge = e.headers.get("WWW-Authenticate", "")
             if (
@@ -153,8 +167,16 @@ class Printer:
                 and self.password
                 and challenge.startswith("Digest")
             ):
-                return self.get(path, self._digest("GET", path, challenge))
+                return self.open(path, self._digest("GET", path, challenge), timeout)
             raise
+
+    def get(self, path: str) -> dict[str, Any]:
+        with self.open(path) as r:
+            return json.load(r) if r.status != 204 else {}
+
+    def raw(self, path: str, timeout: float = 20) -> bytes:
+        with self.open(path, timeout=timeout) as r:
+            return r.read()
 
     def status(self) -> dict[str, Any]:
         return self.get("/api/v1/status")
@@ -169,6 +191,7 @@ class Snap(NamedTuple):
     z: float | None
     progress: float | None
     time_printing: float | None
+    time_remaining: float | None = None
 
     @property
     def active(self) -> bool:
@@ -188,14 +211,69 @@ def snapshot(printer: Printer) -> Snap | None:
         p.get("axis_z"),
         j.get("progress"),
         j.get("time_printing"),
+        j.get("time_remaining"),
     )
 
 
-def job_name(printer: Printer) -> str:
+def job_info(printer: Printer) -> dict[str, Any]:
     try:
-        return (printer.job().get("file") or {}).get("display_name") or ""
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return ""
+        return printer.job()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        log(f"job info failed: {e}")
+        return {}
+
+
+def job_name(printer: Printer) -> str:
+    return (job_info(printer).get("file") or {}).get("display_name") or ""
+
+
+def now() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def bgcode_meta(stream: Any) -> tuple[dict[str, str], bytes | None]:
+    # Metadata blocks precede the gcode, so read only until the first gcode block.
+    # Returns (key=value pairs, largest PNG thumbnail).
+    # Spec: https://github.com/prusa3d/libbgcode/blob/main/doc/specifications.md
+    header = stream.read(10)
+    if len(header) < 10 or header[:4] != b"GCDE":
+        raise ValueError("not a binary gcode file")
+    _, _, checksum = struct.unpack("<4sIH", header)
+    meta: dict[str, str] = {}
+    png: bytes | None = None
+    while True:
+        head = stream.read(8)
+        if len(head) < 8:
+            break
+        btype, comp, usize = struct.unpack("<HHI", head)
+        if btype == 1:  # gcode
+            break
+        csize = struct.unpack("<I", stream.read(4))[0] if comp else usize
+        params = stream.read(6 if btype == 5 else 2)
+        data = stream.read(csize)
+        stream.read(4 if checksum else 0)
+        if comp == 1:
+            data = zlib.decompress(data)
+        elif comp:
+            continue  # heatshrink, never used for metadata in practice
+        if btype == 5:
+            fmt = struct.unpack("<HHH", params)[0]
+            if fmt == 0 and (png is None or len(data) > len(png)):
+                png = data
+            continue
+        for line in data.decode(errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and (btype != 2 or key in SLICER_KEYS):
+                meta[key.strip()] = value.strip().strip('"')
+    return meta, png
+
+
+def fetch_gcode_meta(
+    printer: Printer, download: str
+) -> tuple[dict[str, str], bytes | None]:
+    # PrusaLink refuses (404) the download while the file is being printed
+    with printer.open(download, timeout=60) as r:
+        return bgcode_meta(r)
 
 
 def slug(name: str) -> str:
@@ -252,6 +330,18 @@ class Session:
         self.last_t = 0.0
         LOGS.mkdir(parents=True, exist_ok=True)
         LOGFILE = LOGS / f"{self.out.name}.log"
+        if "token" not in self.read_meta():
+            self.meta(token=secrets.token_urlsafe(9))
+
+    def read_meta(self) -> dict[str, Any]:
+        return read_meta(self.out)
+
+    def meta(self, **updates: Any) -> None:
+        # Merge into meta.json; the web view reads it, so write atomically
+        data = self.read_meta() | updates
+        tmp = self.out / (META + ".part")
+        tmp.write_text(json.dumps(data, indent=1))
+        tmp.rename(self.out / META)
 
     def close(self) -> None:
         global LOGFILE
@@ -268,6 +358,13 @@ class Session:
     def saved(self, why: str) -> None:
         log(f"{self.n:05d}.jpg {why}")
         self.n += 1
+
+
+def read_meta(out: Path) -> dict[str, Any]:
+    try:
+        return json.loads((out / META).read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 def split_jpegs(buf: bytes) -> tuple[list[bytes], bytes]:
@@ -385,10 +482,10 @@ class TrackedSession(Session):
         log("received no frame")
         return False
 
-    def maybe_layer(self, z: float | None) -> None:
+    def maybe_layer(self, z: float | None) -> str | None:
         event = self.layers.update(z)
         if not event:
-            return
+            return None
         with self.lock:
             best, self.best = self.best, None
             latest = self.latest
@@ -400,6 +497,7 @@ class TrackedSession(Session):
             self._write(jpg, f"{event} z={z:.2f} {info}")
         elif latest and event == "layer":
             self._write(latest, f"z={z:.2f} no candidate")
+        return event
 
     def close(self) -> None:
         self.stream.stop()
@@ -409,6 +507,58 @@ class TrackedSession(Session):
 def make_session(camera: str, out: Path | str, snap: Snap | None) -> TrackedSession:
     gate = not (snap and snap.time_printing and snap.time_printing > JOIN_GRACE)
     return TrackedSession(camera, out, gate)
+
+
+def record_start(sess: Session, printer: Printer, snap: Snap | None) -> None:
+    # Job facts known at print time, plus the slicer preview PrusaLink serves
+    job = job_info(printer)
+    file = job.get("file") or {}
+    sess.meta(
+        started=now(),
+        job_id=job.get("id"),
+        state=job.get("state"),
+        progress=job.get("progress"),
+        time_printing=job.get("time_printing"),
+        time_remaining=job.get("time_remaining"),
+        file={k: file.get(k) for k in ("name", "display_name", "path", "size")},
+        refs=file.get("refs") or {},
+        joined_late=bool(
+            snap and snap.time_printing and snap.time_printing > JOIN_GRACE
+        ),
+    )
+    thumb = (file.get("refs") or {}).get("thumbnail")
+    if thumb and not (sess.out / THUMB).exists():
+        try:
+            (sess.out / THUMB).write_bytes(printer.raw(thumb))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log(f"thumbnail failed: {e}")
+
+
+def record_progress(sess: TrackedSession, snap: Snap) -> None:
+    sess.meta(
+        state=snap.state,
+        progress=snap.progress,
+        time_printing=snap.time_printing,
+        time_remaining=snap.time_remaining,
+        layers=sess.layers.count,
+        frames=sess.n,
+    )
+
+
+def record_end(sess: Session, printer: Printer, state: str | None) -> None:
+    sess.meta(ended=now(), state=state, frames=sess.n)
+    download = sess.read_meta().get("refs", {}).get("download")
+    if not download:
+        return
+    try:
+        gcode, png = fetch_gcode_meta(printer, download)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        log(f"gcode metadata failed: {e}")
+        return
+    sess.meta(gcode=gcode)
+    if png:
+        (sess.out / THUMB).write_bytes(png)
+    log(f"gcode metadata: {len(gcode)} keys" + (", thumbnail" if png else ""))
 
 
 def capture_interval(
@@ -425,8 +575,11 @@ def capture_interval(
 def capture_layers(
     printer: Printer, camera: str, out: Path | str, poll: float, until_done: bool
 ) -> None:
-    sess = make_session(camera, out, snapshot(printer))
+    snap = snapshot(printer)
+    sess = make_session(camera, out, snap)
     log(f"layer capture into {out}")
+    if snap and snap.active:
+        record_start(sess, printer, snap)
     sess.grab("start")
     while True:
         snap = snapshot(printer)
@@ -434,8 +587,10 @@ def capture_layers(
             if until_done and snap.state not in ACTIVE:
                 log(f"printer {snap.state}, done: {sess.n} frames")
                 sess.close()
+                record_end(sess, printer, snap.state)
                 return
-            sess.maybe_layer(snap.z)
+            if sess.maybe_layer(snap.z):
+                record_progress(sess, snap)
         time.sleep(poll)
 
 
@@ -455,7 +610,7 @@ def watch(
         if snap:
             if snap.active and (sess is None or job_id != snap.job_id):
                 if sess:
-                    finish(sess, fps, max_duration)
+                    finish(sess, printer, None, fps, max_duration)
                 name = slug(job_name(printer))
                 out = (
                     Path(outdir)
@@ -466,18 +621,23 @@ def watch(
                     f"job {snap.job_id} {name!r} started "
                     f"(progress {snap.progress}%, {snap.time_printing}s in, z={snap.z})"
                 )
+                record_start(sess, printer, snap)
                 sess.grab("start")
             elif sess and not snap.active:
                 log(f"job {job_id} ended ({snap.state})")
-                finish(sess, fps, max_duration)
+                finish(sess, printer, snap.state, fps, max_duration)
                 sess = None
             elif sess:
-                sess.maybe_layer(snap.z)
+                if sess.maybe_layer(snap.z):
+                    record_progress(sess, snap)
         time.sleep(poll)
 
 
-def finish(sess: Session, fps: int, max_duration: int) -> None:
+def finish(
+    sess: Session, printer: Printer, state: str | None, fps: int, max_duration: int
+) -> None:
     sess.close()
+    record_end(sess, printer, state)
     if sess.n < 2:
         log(f"{sess.out}: only {sess.n} frames, not rendering")
         return
