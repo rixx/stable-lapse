@@ -152,9 +152,10 @@ class Print:
     @property
     def print_time(self) -> float | None:
         printing = self.meta.get("time_printing")
-        if self.meta.get("joined_late") or not self.ended or printing:
+        started = parse_dt(self.meta.get("started"))
+        if self.meta.get("joined_late") or not self.ended or printing or not started:
             return printing
-        return (self.ended - self.started).total_seconds()
+        return (self.ended - started).total_seconds()
 
     @property
     def layers(self) -> int:
