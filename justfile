@@ -21,6 +21,10 @@ capture *args:
 render dir *args:
     "{{ script }}" render "{{ dir }}" {{ args }}
 
+# Render every finished frames dir again, e.g. after a defaults change
+rerender *args:
+    "{{ script }}" rerender {{ args }}
+
 # Print PrusaLink status
 status:
     "{{ script }}" status

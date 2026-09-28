@@ -11,6 +11,7 @@ Usage: timelapse.py [command]
     capture  grab frames right now (per layer via PrusaLink, or per --interval)
     watch    wait for print jobs, capture each one per layer, render on finish
     render   build an mp4 or gif for a frames directory
+    rerender render every finished frames directory again (after a defaults change)
     status   one PrusaLink status line
 
 Configure PrusaLink by placing a file under ~/.config/print-timelapse.toml:
@@ -67,6 +68,11 @@ MIN_LAYERS = 3
 MIN_FRAMES = 10
 POSTER_WIDTH = 640
 JOIN_GRACE = 600  # seconds into a job after which no start-up gate applies
+LIVE_WINDOW = 900
+FPS = 30
+HOLD = 1.0  # seconds the last frame stays
+MAX_DURATION = 20
+SHORT_DURATION = 5
 GIF_WIDTH = 640
 STREAM_FPS = 6
 BG_SAMPLES = 40  # frames per layer
@@ -338,10 +344,7 @@ class Session:
         return read_meta(self.out)
 
     def meta(self, **updates: Any) -> None:
-        data = self.read_meta() | updates
-        tmp = self.out / (META + ".part")
-        tmp.write_text(json.dumps(data, indent=1))
-        tmp.rename(self.out / META)
+        write_meta(self.out, **updates)
 
     def close(self) -> None:
         global LOGFILE
@@ -365,6 +368,13 @@ def read_meta(out: Path) -> dict[str, Any]:
         return json.loads((out / META).read_text())
     except (OSError, ValueError):
         return {}
+
+
+def write_meta(out: Path, **updates: Any) -> None:
+    data = read_meta(out) | updates
+    tmp = out / (META + ".part")
+    tmp.write_text(json.dumps(data, indent=1))
+    tmp.rename(out / META)
 
 
 def split_jpegs(buf: bytes) -> tuple[list[bytes], bytes]:
@@ -642,10 +652,7 @@ def finish(
         return
     record_end(sess, printer, state)
     try:
-        render(
-            sess.out, RENDER / f"{sess.out.name}.mp4", fps, max_duration=max_duration
-        )
-        poster(sess.out, RENDER / f"{sess.out.name}.jpg")
+        render_set(sess.out, fps=fps, max_duration=max_duration)
     except subprocess.CalledProcessError as e:
         log(f"render failed: {e.stderr.decode(errors='replace')[-500:]}")
 
@@ -680,10 +687,10 @@ def thin(files: list[Path], limit: int) -> list[Path]:
 def render(
     frames: Path | str,
     out: Path | str,
-    fps: int = 30,
-    hold: float = 2.0,
+    fps: int = FPS,
+    hold: float = HOLD,
     crf: int = 25,
-    max_duration: int = 20,
+    max_duration: int = MAX_DURATION,
     gif: bool = False,
 ) -> Path:
     frames, out = Path(frames), Path(out)
@@ -715,6 +722,51 @@ def render(
     concat.unlink()
     log(f"{out} ({len(files)} frames, {len(files) / fps + hold:.0f}s)")
     return out
+
+
+def render_set(
+    frames: Path | str,
+    out: Path | str | None = None,
+    fps: int = FPS,
+    hold: float = HOLD,
+    crf: int = 25,
+    max_duration: int = MAX_DURATION,
+) -> dict[str, Path]:
+    frames = Path(frames)
+    out = Path(out) if out else RENDER / f"{frames.name}.mp4"
+    short = out.with_name(out.stem + ".short.mp4")
+    files = sorted(frames.glob("*.jpg"))
+    cuts = {"full": (out, max_duration)}
+    if len(files) > fps * SHORT_DURATION and (
+        not max_duration or max_duration > SHORT_DURATION
+    ):
+        cuts["short"] = (short, SHORT_DURATION)
+    else:
+        short.unlink(missing_ok=True)
+    done: dict[str, Path] = {}
+    info: dict[str, dict[str, float]] = {}
+    for name, (path, limit) in cuts.items():
+        done[name] = render(frames, path, fps, hold, crf, limit)
+        n = len(thin(files, fps * limit if limit else 0))
+        info[name] = {"frames": n, "seconds": round(n / fps + hold, 1)}
+    poster(frames, out.with_suffix(".jpg"))
+    write_meta(frames, renders=info)
+    return done
+
+
+def rerender(fps: int, hold: float, crf: int, max_duration: int, force: bool) -> None:
+    for d in sorted(FRAMES.iterdir()) if FRAMES.is_dir() else []:
+        files = sorted(d.glob("[0-9]*.jpg")) if d.is_dir() else []
+        if len(files) < MIN_FRAMES:
+            log(f"{d.name}: {len(files)} frames, keeping the existing render")
+            continue
+        if not force and time.time() - files[-1].stat().st_mtime < LIVE_WINDOW:
+            log(f"{d.name}: still capturing, skipped")
+            continue
+        try:
+            render_set(d, fps=fps, hold=hold, crf=crf, max_duration=max_duration)
+        except subprocess.CalledProcessError as e:
+            log(f"{d.name}: render failed: {e.stderr.decode(errors='replace')[-500:]}")
 
 
 def main() -> None:
@@ -750,16 +802,19 @@ def main() -> None:
         "watch", help="Run as daemon, create one timelapse per print job"
     )
     w.add_argument("--outdir", default=str(FRAMES))
-    w.add_argument("--fps", type=int, default=30)
+    w.add_argument("--fps", type=int, default=FPS)
     w.add_argument(
         "--max-duration",
         type=int,
-        default=20,
+        default=MAX_DURATION,
         help="seconds; drops frames evenly to fit, 0 = keep all",
     )
     w.add_argument("--poll", type=float, default=2, help="PrusaLink poll interval")
 
-    r = sub.add_parser("render", help="Render an mp4")
+    r = sub.add_parser(
+        "render",
+        help=f"Render an mp4, plus a {SHORT_DURATION}s cut for longer prints",
+    )
     r.add_argument("frames")
     r.add_argument("--out", help="default: render/<frames dir name>.mp4 or .gif")
     r.add_argument(
@@ -767,20 +822,26 @@ def main() -> None:
         action="store_true",
         help=f"{GIF_WIDTH}px wide looping gif instead of mp4",
     )
-    r.add_argument("--fps", type=int, help="default 30, gif 10")
-    r.add_argument(
-        "--hold",
-        type=float,
-        help="seconds to freeze the last frame for a less abrupt ending; default 2, gif 1",
+    rr = sub.add_parser("rerender", help="Render every finished frames directory again")
+    rr.add_argument(
+        "--force", action="store_true", help="include directories still capturing"
     )
-    r.add_argument(
-        "--crf", type=int, default=25, help="x264 quality, +3 halves the size"
-    )
-    r.add_argument(
-        "--max-duration",
-        type=int,
-        help="seconds; drops frames evenly to fit, 0 = keep all; default 20, gif 3",
-    )
+    for sp in (r, rr):
+        sp.add_argument("--fps", type=int, help=f"default {FPS}, gif 10")
+        sp.add_argument(
+            "--hold",
+            type=float,
+            default=HOLD,
+            help="seconds to freeze the last frame for a less abrupt ending",
+        )
+        sp.add_argument(
+            "--crf", type=int, default=25, help="x264 quality, +3 halves the size"
+        )
+        sp.add_argument(
+            "--max-duration",
+            type=int,
+            help=f"seconds; drops frames evenly to fit, 0 = keep all; default {MAX_DURATION}, gif 3",
+        )
 
     sub.add_parser("status", help="Print PrusaLink status")
 
@@ -806,22 +867,33 @@ def main() -> None:
         frames = Path(a.frames)
         if not frames.is_dir() and (FRAMES / a.frames).is_dir():
             frames = FRAMES / a.frames
-        render(
-            frames,
-            a.out or RENDER / f"{frames.name}.{'gif' if a.gif else 'mp4'}",
-            a.fps or (10 if a.gif else 30),
-            a.hold if a.hold is not None else (1 if a.gif else 2),
-            a.crf,
-            a.max_duration if a.max_duration is not None else (3 if a.gif else 20),
-            a.gif,
-        )
-        if not a.gif:
-            poster(
+        if a.gif:
+            render(
                 frames,
-                Path(a.out).with_suffix(".jpg")
-                if a.out
-                else RENDER / f"{frames.name}.jpg",
+                a.out or RENDER / f"{frames.name}.gif",
+                a.fps or 10,
+                a.hold,
+                a.crf,
+                a.max_duration if a.max_duration is not None else 3,
+                gif=True,
             )
+        else:
+            render_set(
+                frames,
+                a.out,
+                a.fps or FPS,
+                a.hold,
+                a.crf,
+                a.max_duration if a.max_duration is not None else MAX_DURATION,
+            )
+    elif a.cmd == "rerender":
+        rerender(
+            a.fps or FPS,
+            a.hold,
+            a.crf,
+            a.max_duration if a.max_duration is not None else MAX_DURATION,
+            a.force,
+        )
     elif a.cmd == "capture":
         out = (
             Path(a.out)

@@ -31,13 +31,24 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from timelapse import BASE, CFG, META, MIN_FRAMES, THUMB, log, poster, read_meta, slug
+from timelapse import (
+    BASE,
+    CFG,
+    LIVE_WINDOW,
+    META,
+    MIN_FRAMES,
+    THUMB,
+    log,
+    poster,
+    read_meta,
+    slug,
+)
 
 REPO = "https://github.com/rixx/stable-lapse"
 TZ = zoneinfo.ZoneInfo(CFG["web"]["tz"]) if CFG["web"].get("tz") else None
 EAGER_IMAGES = 12
 DELETE_AFTER = 86400
-LIVE_WINDOW = 900
+PREFETCH_CLIPS = 4  # index cards whose clip the browser fetches ahead of a click
 SCAN_TTL = 3
 PRINTERS = {
     "COREONE": "Prusa CORE One",
@@ -104,6 +115,7 @@ class Print:
     meta: dict[str, Any]
     frames: list[Path]
     video: Path | None
+    short: Path | None
     gif: Path | None
     poster_file: Path
 
@@ -178,6 +190,26 @@ class Print:
     @property
     def latest(self) -> str | None:
         return "latest.jpg" if self.frames else self.poster
+
+    @property
+    def clip(self) -> str | None:
+        # The cut the player loads first
+        if self.short:
+            return "video.short.mp4"
+        return "video.mp4" if self.video else None
+
+    def cuts(self) -> list[tuple[str, str]]:
+        # (file, label) per available cut, shortest first
+        renders = self.meta.get("renders") or {}
+        out = []
+        for key, name, label in (
+            ("short", "video.short.mp4", "Short"),
+            ("full", "video.mp4", "Full"),
+        ):
+            if getattr(self, key if key == "short" else "video"):
+                seconds = (renders.get(key) or {}).get("seconds")
+                out.append((name, f"{label} · {seconds:.0f} s" if seconds else label))
+        return out
 
     def ensure_poster(self) -> Path | None:
         stale = (
@@ -281,6 +313,7 @@ class Catalog:
                 log(f"{d.name}: new token")
             frames = sorted(d.glob("[0-9]*.jpg"))
             video = self.render / f"{d.name}.mp4"
+            short = self.render / f"{d.name}.short.mp4"
             gif = self.render / f"{d.name}.gif"
             if not video.exists() and len(frames) < MIN_FRAMES:
                 newest = max([d, *frames], key=lambda f: f.stat().st_mtime)
@@ -294,6 +327,7 @@ class Catalog:
                     meta,
                     frames,
                     video if video.exists() else None,
+                    short if short.exists() and video.exists() else None,
                     gif if gif.exists() else None,
                     self.render / f"{d.name}.jpg",
                 )
@@ -360,6 +394,9 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: v
 .stats b { display: block; font-size: 20px; color: var(--text); font-weight: 600; letter-spacing: -.01em; }
 .player { background: #000; border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
 .player video, .player img { width: 100%; display: block; max-height: 78vh; object-fit: contain; background: #000; }
+.cuts { display: flex; gap: 6px; padding: 8px 10px; background: var(--card); }
+.cuts button { font: inherit; font-size: 13px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; }
+.cuts button.on { background: var(--orange); border-color: var(--orange); color: #fff; }
 .detail { display: grid; grid-template-columns: 1fr 300px; gap: 24px; margin-top: 24px; align-items: start; }
 .detail h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -.02em; }
 .detail .file { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; margin-bottom: 18px; }
@@ -435,7 +472,12 @@ def card(p: Print, lazy: bool) -> str:
         bits.append(f"{p.layers} layers")
     if printed := duration(p.print_time):
         bits.append(printed)
-    return f"""<a class="card" href="/p/{p.token}/">
+    clip = (
+        f' data-clip="/p/{p.token}/{p.clip}"'
+        if p.clip and p.status != "printing"
+        else ""
+    )
+    return f"""<a class="card" href="/p/{p.token}/"{clip}>
   <div class="poster{"" if p.poster else " empty"}">{poster}{badge}</div>
   <div class="body"><p class="title" title="{h(p.file_name)}">{h(p.title)}</p>
   <div class="meta">{"".join(f"<span>{h(b)}</span>" for b in bits)}</div></div>
@@ -480,6 +522,7 @@ def index_page(prints: list[Print]) -> str:
     if rest:
         cards = "".join(card(p, i >= EAGER_IMAGES) for i, p in enumerate(rest))
         body += f"<h2>{len(rest)} prints</h2><div class='grid'>{cards}</div>"
+        body += INDEX_JS % PREFETCH_CLIPS
     if not prints:
         body = '<p class="empty-state">No prints yet.</p>'
     return page("Timelapses", body, sub=f"{len(prints)} prints")
@@ -505,8 +548,8 @@ def social(p: Print, base: str) -> str:
                 ("og:image:width", str(size[0])),
                 ("og:image:height", str(size[1])),
             ]
-    if p.video and p.status != "printing":
-        video = url + "video.mp4"
+    if p.clip and p.status != "printing":
+        video = url + p.clip
         tags += [
             ("og:video", video),
             ("og:video:secure_url", video),
@@ -549,13 +592,61 @@ def scrubber(p: Print) -> str:
 </script>"""
 
 
+PLAYER_JS = """<script>
+(() => {
+  const player = document.querySelector('.player'), video = player.querySelector('video');
+  video.play().catch(() => {});
+  const buttons = [...player.querySelectorAll('.cuts button')];
+  if (!buttons.length) return;
+  // The other cut downloads in the background once this one plays, so the
+  // switch is instant.
+  const ready = {};
+  const warm = (url) => fetch(url).then(r => r.blob()).then(b => { ready[url] = URL.createObjectURL(b); }).catch(() => {});
+  video.addEventListener('loadeddata', () => {
+    buttons.forEach(b => { if (!b.classList.contains('on')) warm(b.dataset.src); });
+  }, {once: true});
+  buttons.forEach(b => b.addEventListener('click', () => {
+    if (b.classList.contains('on')) return;
+    buttons.forEach(x => x.classList.toggle('on', x === b));
+    const frac = video.duration ? video.currentTime / video.duration : 0;
+    video.addEventListener('loadedmetadata', () => { video.currentTime = frac * video.duration; }, {once: true});
+    video.src = ready[b.dataset.src] || b.dataset.src;
+    video.play().catch(() => {});
+  }));
+})();
+</script>"""
+
+INDEX_JS = """<script>
+(() => {
+  // Fetch a card's clip ahead of the click: the first few right away, the rest on hover
+  const seen = new Set();
+  const prefetch = (url) => {
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    const link = document.createElement('link');
+    link.rel = 'prefetch'; link.href = url; link.as = 'video';
+    document.head.appendChild(link);
+  };
+  const cards = [...document.querySelectorAll('.card[data-clip]')];
+  cards.slice(0, %d).forEach(c => prefetch(c.dataset.clip));
+  cards.forEach(c => ['mouseenter', 'touchstart', 'focus'].forEach(ev =>
+    c.addEventListener(ev, () => prefetch(c.dataset.clip), {passive: true})));
+})();
+</script>"""
+
+
 def detail_page(p: Print, base: str) -> str:
     live = p.status == "printing"
     if p.video and not live:
+        cuts = "".join(
+            f'<button data-src="/p/{p.token}/{name}"{" class=on" if name == p.clip else ""}>{h(label)}</button>'
+            for name, label in p.cuts()
+        )
         player = (
-            f'<video controls autoplay muted loop playsinline preload="auto" poster="/p/{p.token}/poster.jpg">'
-            f'<source src="/p/{p.token}/video.mp4" type="video/mp4"></video>'
-            "<script>document.querySelector('video').play().catch(() => {});</script>"
+            f'<video controls autoplay muted loop playsinline preload="auto" poster="/p/{p.token}/poster.jpg"'
+            f' src="/p/{p.token}/{p.clip}"></video>'
+            + (f'<div class="cuts">{cuts}</div>' if p.short else "")
+            + PLAYER_JS
         )
     elif p.latest:
         player = f'<img src="/p/{p.token}/{p.latest}?t={int(time.time())}" alt="">'
@@ -571,6 +662,8 @@ def detail_page(p: Print, base: str) -> str:
     actions = ""
     if p.video:
         actions += f'<a class="btn" href="/p/{p.token}/video.mp4" download="{h(p.dir.name)}.mp4">Download mp4</a>'
+    if p.short:
+        actions += f'<a class="btn ghost" href="/p/{p.token}/video.short.mp4" download="{h(p.dir.name)}.short.mp4">Download short mp4</a>'
     if p.gif:
         actions += f'<a class="btn ghost" href="/p/{p.token}/video.gif" download="{h(p.dir.name)}.gif">Download gif</a>'
     thumb = (
@@ -630,6 +723,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.html(detail_page(p, self.base_url()), head)
         if rest == "/video.mp4" and p.video:
             return self.file(p.video, "video/mp4", head, done)
+        if rest == "/video.short.mp4" and p.short:
+            return self.file(p.short, "video/mp4", head, done)
         if rest == "/video.gif" and p.gif:
             return self.file(p.gif, "image/gif", head, done)
         if rest == "/poster.jpg" and p.poster == "poster.jpg":
