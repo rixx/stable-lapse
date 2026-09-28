@@ -27,7 +27,6 @@ import json
 import os
 import random
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -447,7 +446,6 @@ def watch(
     poll: float,
     fps: int,
     max_duration: int,
-    keep_frames: bool,
 ) -> None:
     log("watching for jobs")
     job_id: int | None = None
@@ -457,7 +455,7 @@ def watch(
         if snap:
             if snap.active and (sess is None or job_id != snap.job_id):
                 if sess:
-                    finish(sess, fps, max_duration, keep_frames)
+                    finish(sess, fps, max_duration)
                 name = slug(job_name(printer))
                 out = Path(outdir) / f"{dt.datetime.now():%Y%m%d-%H%M}-{name}"
                 job_id, sess = snap.job_id, make_session(camera, out, snap)
@@ -468,14 +466,14 @@ def watch(
                 sess.grab("start")
             elif sess and not snap.active:
                 log(f"job {job_id} ended ({snap.state})")
-                finish(sess, fps, max_duration, keep_frames)
+                finish(sess, fps, max_duration)
                 sess = None
             elif sess:
                 sess.maybe_layer(snap.z)
         time.sleep(poll)
 
 
-def finish(sess: Session, fps: int, max_duration: int, keep_frames: bool) -> None:
+def finish(sess: Session, fps: int, max_duration: int) -> None:
     sess.close()
     if sess.n < 2:
         log(f"{sess.out}: only {sess.n} frames, not rendering")
@@ -486,9 +484,6 @@ def finish(sess: Session, fps: int, max_duration: int, keep_frames: bool) -> Non
         )
     except subprocess.CalledProcessError as e:
         log(f"render failed: {e.stderr.decode(errors='replace')[-500:]}")
-        return
-    if not keep_frames:
-        shutil.rmtree(sess.out)
 
 
 def thin(files: list[Path], limit: int) -> list[Path]:
@@ -580,7 +575,6 @@ def main() -> None:
         help="seconds; drops frames evenly to fit, 0 = keep all",
     )
     w.add_argument("--poll", type=float, default=2, help="PrusaLink poll interval")
-    w.add_argument("--keep-frames", action="store_true")
 
     r = sub.add_parser("render", help="Render an mp4")
     r.add_argument("frames")
@@ -645,7 +639,7 @@ def main() -> None:
         else:
             capture_layers(printer, a.camera, out, a.poll, a.until_done)
     elif a.cmd == "watch":
-        watch(printer, a.camera, a.outdir, a.poll, a.fps, a.max_duration, a.keep_frames)
+        watch(printer, a.camera, a.outdir, a.poll, a.fps, a.max_duration)
 
 
 if __name__ == "__main__":
